@@ -52,8 +52,8 @@ that the hardware lacks the feature.
 | [FM radio](fm-radio.md) | Commands `80/81` beyond "antenna switch", the patch stream, property `1404` (10 in OSOS, `0x14` in the diagnostics), RF units |
 | [Camera interface](camera-interface.md) | Format modes other than 1/2/3, auxiliary block masks (`+04 = 0x98000001`), input signal polarity |
 | [Sensors](camera-sensors.md) | Meaning of most of the 240 vendor register writes; why the diagnostics 7739 table is a different register set |
-| [Video encoder](video-encoder.md) | Bitstream engine bits `+20/+50/+dc/+f0`, picture engine `+168..+184`, mode-engine words `+04[31:26]` and `+08`, what `0x550174` accumulates, host `904/908/910` beyond their formulas, the slice-limit unit |
-| [H.264 decoder](video-decoder.md) | Status bits beyond the ones polled, the per-entry type byte that adds `0x8080` to a reference-list entry, which sub-block the `0x3e0` reset form resets |
+| [Video encoder](video-encoder.md) | Bitstream engine bits `+20/+50/+dc/+f0`, picture engine `+168..+184`, mode-engine words `+04[31:26]` and `+08`, what `0x550174` accumulates, host `904/908/910` beyond their formulas, the slice-limit unit, the embedded processor's core and clock, local RAM size, DMA modes 3/7 and whether the processor can copy system memory in |
+| [H.264 decoder](video-decoder.md) | Status bits beyond the ones polled, the per-entry type byte that adds `0x8080` to a reference-list entry, which sub-block the `0x3e0` reset form resets, whether the CABAC/B/interlace/High-profile modes programmed by the iPod OS decode correctly on the silicon |
 | [JPEG encoder](jpeg-encoder.md) | Pixel formats other than the one used, control fields written as constants |
 | [Compositor](display-compositor.md) | Per-layer nibbles in `010` (diagnostics) versus background use (OSOS), filter-threshold classes, fields named by bit position only |
 | [LCD controller](lcd-controller.md) | Registers `18/20/68/78/7c/88`, every LCDCON bit |

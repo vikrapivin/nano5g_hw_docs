@@ -137,6 +137,15 @@ The diagnostics `TestNand` module reaches the NAND only through protocols; it ha
 - `nandsize`: SystemConfig protocol (`ca7feebd`) GetInfo(1) into a `0x134`-byte record, magic `0x53797349`; size in KB = `info[0x40] * (info[0x3f] >> 10)` (`diag TestNand.pe+0xd30`).
 - The SoC chip ID (`diag TestM2ChipID`, `m2chipid`) is a separate block: it prints CID_VALID, CHIPIDL_VER (`CHIPIDL & 0xff00003f`), CHIPIDL_CAL (the rest), CHIPIDH, DIEIDL, DIEIDH (die ID words at `+0x0c/+0x10`) and ECID_VERSION; protocol GUID `ddee1ef2-dc49-4799-90e6-4b0c8bd36810` (`diag TestM2ChipID.pe+0xb10..0xb8e`). See [chipid.md](chipid.md). It is not the NAND ID.
 
+## Firmware release differences
+
+The restore/disk OS of iPod OS 1.0.2 recognizes ten chip IDs in its population
+table; the 1.0.1 restore OS recognizes eight. 1.0.2 adds `98e79432` (Toshiba)
+and `ecd79472` (Samsung); the other eight (`2cd7943e`, `98d79432`, `98de9532`,
+`add79425`, `ecd514b6`, `ecd59429`, `ecd755b6`, `ecd7d529`) are in both. The
+six sequencer programs and the clock-gate table are byte-identical in both
+releases.
+
 ## Not established
 
 Package markings from ID bytes, CE-to-die wiring, R/B# fanout, physical pinout,
@@ -155,3 +164,4 @@ device-observed Samsung R/W result covers only that population.
 | Non-power-of-two die strides | reference | observed; software address translation, no extra usable blocks |
 | NANDChipID records, per-die unique IDs, `nandsize` formula | `diag TestNand.pe+0xb8c`, `+0xf50`, `+0xd30` | observed; NANDChipID provider not located |
 | Reported 4-KiB Samsung device | Device-read ID `0x2994d5ec`, four CEs, 4096-byte pages, 218 spare bytes | device; one unit |
+| 1.0.2 adds NAND IDs `98e79432` and `ecd79472` to the restore OS table | table at `disk mem:0x080782d8` (1.0.2) compared with the 1.0.1 restore OS image | observed |

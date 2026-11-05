@@ -20,7 +20,7 @@ such.
   [speaker amplifier](speaker-amplifier.md), [headphone/accessory](headphone-interface.md),
   [FM radio](fm-radio.md).
 - **Imaging/display:** [camera sensors](camera-sensors.md),
-  [capture interface](camera-interface.md), [video encoder](video-encoder.md),
+  [capture interface](camera-interface.md), [video encoder](video-encoder.md) and its [firmware](video-encoder-firmware.md),
   [H.264 decoder](video-decoder.md), [JPEG encoder](jpeg-encoder.md),
   [compositor/scaler](display-compositor.md), [scaler/colour converter](scaler.md), [LCD controller](lcd-controller.md),
   [panels](lcd-panels.md), [TV pipeline](tvout.md),

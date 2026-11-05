@@ -77,6 +77,21 @@ All 324 wide-filter words and 162 narrow-filter words are verified against
 firmware (wide table at `osos mem:0x086b4ebc`, narrow table at
 `osos mem:0x086b53cc`).
 
+**Table layout and generating function** (inferred from the table values).
+Each set holds 9 phases, the sub-pixel offset `f = p/16` for `p = 0..8`
+(the hardware mirrors the other half), with weights in 1/128 stored as two
+signed 12-bit values per word (low half first). A wide set has 8 taps; in
+register order their source offsets are `-2, -3, 0, -1, +2, +1, +4, +3`. A
+narrow set has 4 taps at `0, -1, +2, +1`. Sets 1..7 are Hamming-windowed sinc
+filters, weight ∝ `sinc(c·d) · (0.54 + 0.46·cos(π·d/R))` for tap distance
+`d = |offset − f|`, window radius `R` = half the tap count, and cutoff
+`c = (k+1)/8` for set `k`: set 7 (`c = 1`) is selected for steps up to 1:1,
+set 3 (`c = 1/2`) for 2:1. With each weight rounded to 1/128 and the largest
+weight absorbing the rounding so that every phase sums to 128, the function
+reproduces 99 of the 126 phase rows of sets 1..7 exactly and the others to
+within 2/128 per weight. Set 0 repeats set 1 and set 8 is not selected by
+`0x0829cdc4`.
+
 ## Gamma and enhancement programming
 
 Table upload `mem:0x0824c9d0` preserves `408` outside mask `1f0ff`:
@@ -197,5 +212,6 @@ The [scaler block](scaler.md) at `0x39000000` repeats this filter-bank layout.
 | Filter/gamma/enhancement table values | addresses given above | observed (byte comparison) |
 | Unknown writes and save/restore ranges | the 111-row source-access inventory | listed, meaning unknown |
 | Diagnostic init values, layer nibbles, video-layer setup | `diag Clcd.pe+0x434`, `+0x540..0x5a8`, `+0x718`, `+0x76c` | observed |
+| Filter sets 1..7 are Hamming-windowed sinc, cutoff (k+1)/8, 9 phases in 1/16 steps | table values above, least-error fit | inferred |
 | Diagnostic filter tables differ in 4 places | `diag Clcd.pe+0xb08`, `+0x1018` vs OSOS tables | observed (byte comparison) |
 | Optical/electrical specification | not derivable from current coverage | not decoded |

@@ -109,9 +109,13 @@ Clock entry `mem:0x08551db0` enables masks `80` at `0x3c500058` and `30000` at
 
 ## Unknowns
 
-The preset dispatcher, six-slot delayed pipeline and session lifetime are
-host software above the engine. Physical throughput, fault-bit meanings and the
-engine fields listed as unknown in the firmware sections are not known.
+The six-slot delayed pipeline and session lifetime are host software above
+the engine. Not known: physical throughput, fault-bit meanings, the engine
+fields listed as unknown in the firmware sections, the embedded processor's
+core type and clock, the meaning of DMA modes 3 and 7 (7 hangs the device bus when
+started from the core),
+whether the embedded processor can start a system-to-local copy, and whether
+its load/store unit can reach any address outside the encoder.
 
 ## Embedded firmware
 
@@ -121,9 +125,14 @@ encodings, no Thumb), built with the ARM RealView C library, that runs on an
 ARM processor inside the encoder block. Its first nine words are the ARM
 exception vector table (`b` to reset, undefined, SWI, prefetch abort, data
 abort, a `b .` in the reserved slot, IRQ, FIQ). The undefined, SWI, abort,
-IRQ and FIQ handlers all return immediately, so the firmware runs without
-interrupts. The C-library semihosting call (`swi 0x123456`) in the start-up code
-is never reached on hardware.
+IRQ and FIQ stubs (`firmware 0x24..0xb0`) do not return: each loads a handler
+address from a RAM word (`0x5fc4`, `0x5fc8`, `0x5fcc`, `0x5fd0`, `0x5fd8`,
+`0x5fdc` through the literals at `firmware 0xd4..0xe8`) and jumps to it. No code in
+the image writes those words, and they lie above the uploaded image and above
+the stack, so their content after an upload is whatever the RAM held. The
+firmware never enables interrupts and polls every engine. The C-library
+semihosting call (`swi 0x123456`) in the start-up code is never reached on
+hardware.
 
 Layout and memory map as seen by the embedded processor (observed in the
 firmware image; names are ours):
@@ -144,24 +153,24 @@ firmware are reads of the host-written words at the same offset):
 
 | Host offset | Firmware use |
 |---|---|
-| `000`, `008` | written 1 / 3 then 7 during start-up and at picture start (engine enable and mode, inferred) |
+| `000`, `008` | DMA start and mode: `008=3`, `000=1` before the command loop (see [DMA registers](#embedded-processor-local-ram-and-dma)); the `008=7`, `010`, `510=1` writes after the loop call in `firmware 0x2038..0x2070` are never reached |
 | `010` | `((bitstream_engine+a8 & 0x1f) + 7) >> 3` at start-up |
 | `03c` | polled until below 8 at start-up (ready) |
 | `10c` | abort request: non-zero forces command 4 |
 | `114` | doorbell: the command loop reads `c0c` only while this is non-zero |
 | `118/11c`, `120/124` | per-picture parameters read at command time; `120/124` copied to the picture engine `+18/+24` |
-| `300` | bits `[1:0]` profile (0 Baseline `0x42`, 1 Main `0x4d`, 2 High `0x64`), bits above = `level_idc` (SPS writer `0x68c`) |
+| `300` | bits `[1:0]` profile (0 Baseline `0x42`, 1 Main `0x4d`, 2 High `0x64`; 3 writes no profile and constraint bytes, so the SPS is malformed), bits above = `level_idc` (SPS writer `0x68c`) |
 | `314` | deblocking: `[1:0]` disable_deblocking_filter_idc, `[6:2]` beta offset, `[11:7]` alpha offset |
 | `3d4` | bit 0 force-picture-type enable, `[2:1]` forced type |
 | `31c..330`, `344`, `348`, `3cc/3d0` | slice and rate parameters copied into the context at each frame command: `324` minus `0x780` clamped at 0; `3cc/3d0/348` as sign bit plus 31-bit magnitude; `330` bit 31 and bits `[3:0]` (rate path below) |
-| `50c`, `510` | written 1 after the header command / at start-up (completion flags, inferred) |
+| `50c`, `510` | `50c=1` after the header command and at the end of each picture; `510=1` by command 4 just before its endless loop (`firmware 0x1e8c..0x1e98`) (completion flags, inferred) |
 | `600` | picture size source (`>>1` into the picture engine) |
 | `810` | copied to the picture engine `+4c` |
 | `900` | bits `[5:0]` and bit 8 (QP and a flag) |
 | `904`, `908`, `910` | read at frame start and copied to the picture engine `+144/+148/+150` |
 | `90c` | bits `[5:0]` = QP; clamped against the min/max QP fields of the context |
 | `918` | written with `picture_engine+158 & 0x3f` (QP used) |
-| `a00` | frame result (CAVLC): intra macroblock count in the upper half, non-skipped inter count in the lower half (`0xe64`); markers `0x87301018` at start-up, `0xdeaddead` after the second start-up stage, `0xbad0cafe` after command 5 |
+| `a00` | frame result (CAVLC): non-skipped inter macroblock count (`P+0xd4`) in the upper half, intra count (`P+0xd8`) in the lower half (`0xe64`; counters incremented in `0x38b0`); markers `0xdeaddead` at start-up (`firmware 0x2018`, literal `0x2084`), then `0x87301018` when the context is set up on entry to the command loop (`firmware 0x188`, literal `0x10f4`), `0xbad0cafe` after command 5 |
 | `a08` | after a header command: `(bits_a >> 3) << 16 | (bits_b >> 3)`, two header lengths in bytes |
 | `a0c` | after header and frame commands: total bits so far `>> 3` (output byte count); `a10` the same minus a running value |
 | `c08` | bit 31 and bits `[30:0]` copied into the context at each frame |
@@ -169,14 +178,14 @@ firmware are reads of the host-written words at the same offset):
 
 Command loop (firmware `0x1f98`, wait routine `0x1f08`): the processor spins
 until `114` is non-zero, then takes `c0c`; if `10c` is non-zero the command
-becomes 4 regardless. The loop accepts stream indices 0..8.
+becomes 4 regardless. The loop accepts stream indices 0..8, but only 0..3 stay inside the eight-slot stream array, because the pre-frame backup goes to slot `stream+4`.
 
 | Command | Handler | What it does |
 |---|---|---|
 | 0, 3 | none | ignored |
 | 1 | `0x1ef8` | header: resets the bitstream engine (`+30 = 0x32`, `+44/+78/+b4 = 0`), writes the sequence and picture headers (two bit counts reported in `a08`), optionally runs the table set-up routines, reports the byte count in `a0c`, sets `50c = 1` |
 | 2 | `0x1ee4` | encode one picture: frame set-up (`0x1834`: copies the host configuration, clamps QP, selects reference slot 0/1/2), then one pass per slice (`0x1550`, slice header `0x352c`, the entropy-coder handler selected through a function pointer: CAVLC `0x1ca8` or CABAC `0x1d88`, which loops over the macroblocks; `0x1104`), then rate-control bookkeeping (`0xf3c`, writes `a0c/a10`), and the per-stream rate-control state (21 words at `context[0] + stream*0x54`, restored at the next frame) |
-| 4 | `0x1e9c`, `0x1e8c` | stop: tear down, then an endless loop (the host resets the engine) |
+| 4 | `0x1e9c`, `0x1e8c` | stop: frees the context, writes `510=1`, then an endless loop at `0x1e98` (the host resets the engine) |
 | 5 | `0x1ebc` | per-stream parameter update (`0x248`), then `a00 = 0xbad0cafe` |
 
 This matches the host driver, which uses command 1 for the header and
@@ -186,6 +195,108 @@ in bits `15:8` of `c0c` and `114 = 1` as the doorbell.
 The image carries no strings of its own beyond the C library's run-time
 error messages. The engine blocks, header writer, macroblock loop and rate
 control follow.
+
+## Embedded processor, local RAM and DMA
+
+**Processor.** The program is compiled for ARMv4T: it uses `bx` (27 sites), and
+the whole image contains no ARMv5 or later instruction (no `clz`, `blx`, `ldrd`,
+`strd`, saturating or halfword-multiply forms), no long multiply, no halfword
+load/store, and no coprocessor access (no CP15 cache/MMU/ID reads, no VFP). The
+rate-control floating-point arithmetic is done by the C library's software
+floating point. Observed in the disassembly of all 4,368 instructions; the core type and clock are not identified.
+
+**Local RAM** (observed in the start-up code, size inferred):
+
+| Range | Content | Evidence |
+|---|---|---|
+| `0x0000..0x475f` | uploaded image, executed in place | upload length `0x4760` |
+| `0x4760..0x47bf` | the only zero-initialised region (`0x60` bytes) | scatter table at `firmware 0x474c`: `{0x4760, 0x4760, 0x60, zero-init 0x130}` |
+| `0x47c0..` | heap base; the `0x2ec`-byte context is its only allocation (`firmware 0x1f78`) | literal `0x47c0` at `firmware 0x3528` |
+| `..0x5eff` | one stack, top `0x5f00`, shared by FIQ, IRQ, abort, undefined and SVC mode (`firmware 0x34f4..0x351c` sets every mode's SP to the same value) | |
+| `0x5fc4..0x5fe0` | exception handler pointers read by the vector stubs | literals `firmware 0xd4..0xec` |
+
+The highest address the program touches in its own RAM is `0x5fe3`, so the
+local RAM is at least 24 KiB (`0x6000`) (inferred). There is no evidence of a
+cache or of a direct path from the processor's load/store unit to SDRAM: every
+transfer between the encoder and system memory in the firmware goes through
+the DMA registers below. The 1.0.1 program uses the same stack top `0x5f00` and
+the same vector-stub layout.
+
+**DMA registers.** The registers at the start of the host window are one DMA
+channel between encoder-local memory and system memory. The host and the
+embedded processor drive it through the same offsets:
+
+| Offset | Meaning | Host use (program upload) | Firmware use |
+|---|---|---|---|
+| `000` | start, write 1 | 1 | 1 |
+| `008` | mode | never written | `5` for every local-to-system copy; `3` before the command loop (`firmware 0x202c`); mode 3 not decoded (a `7` after the loop is unreachable) |
+| `00c` | length in 32-bit words | `0x11d8` (`0x4760 >> 2`) | `0x20` (128 bytes) per chunk, `2` or `1` in the statistics copy |
+| `014` | system-memory address | SDRAM address of the image | host `348[30:0]` (statistics table) and host `c08[30:0]` (vector rows) plus offsets |
+| `020` | encoder-local address | `0` | `0x600000 + n*0x80` (table RAM) |
+| `030` | done, reads 1 | not read; the host waits for `514` bit 7 (IRQ59) | polled until it reads 1 after every chunk |
+
+Host upload sequence (`osos mem:0x08120bf0`, the DMA start `osos mem:0x08136390` is
+its only use): IRQ reset (`500=0`, `518=1a2`, `508=1`); `110=1`; `00c`, `014`,
+`020=0`, `000=1`; wait for the DMA event; `110=0`; engine reset. The host
+never writes `008`. Observed in both images; that `008` selects the direction is
+inferred from the firmware writing `5` only for copies whose data flows from
+table RAM to a host-supplied address.
+
+**Device tests with a test program in the core** (first runs; the program was
+uploaded by the host sequence above):
+
+| Test | Result | Type |
+|---|---|---|
+| Start-up | the core did not reach its first marker within 500 ms after the upload; it started once the host wrote `108=1` and `134=1` | device |
+| Local RAM | writes at `0x8000` read back at `0x0000`: 32 KiB, wrapping | device |
+| `008=5`, `020` = an address in the core's own RAM (`0x3400`), 8 words | `030` reads 1, but none of the 8 words reached system memory | device |
+| `008=3,0,1,2,6`, `020` in the core's RAM | `030` never read 1 within 200,000 polls | device |
+| `008=4`, `020` in the core's RAM | `030` read 1; the core's buffer did not receive the system data | device |
+| `008=7` | the whole device stopped responding (no further screen update, hard reset needed); twice | device |
+
+Together with the program's use of table-RAM addresses only, this indicates that
+`020` addresses the encoder's own bus (table RAM `0x600000`), not the core's
+program RAM (inferred). Mode 7 is not safe to start from the core with these
+register values.
+
+## Use by the iPod OS
+
+All encoder MMIO in the iPod OS is in the register layer called by one thread,
+`VideoEncodeThread` (created at `osos mem:0x080bb61c`, name string
+`osos mem:0x080bb68c`), owned by the camera pipeline constructor
+`osos mem:0x0809c478`. Its output goes to the MP4 writer for camera clips under
+`/DCIM`. The encoder is used only for camera video recording (observed callers;
+bounded negative search: all literals `0x3e400000..0x3e4fffff` and the
+`movs #0xf9; lsls #22` construction in the image, the playback, voice-memo and
+TV-out paths). No diagnostics, restore or bootloader module touches the block
+(bounded negative search over all their programs for the same constants).
+
+Preset selection (`osos mem:0x080f4ea0`, dispatcher `osos mem:0x0812010c`):
+
+| Preset | Selected when | Picture | Rate | Rate mode | Streams |
+|---|---|---|---|---|---|
+| 5 | default | 640x480, 30 fps, IDR period 30 | 2.5 Mbit/s | 1 | 0 |
+| 4 | `_look_ahead_video_encoding` exists | as 5 | 2.5 Mbit/s | 2 (delayed) | 1 and 0 |
+| 6 | `_hifi_video_encoding` exists (checked first) | as 5 | 13.5 Mbit/s, QP 0 start | 0 | 0 |
+
+Both files are looked up in `iPod_Control\Device\` only when
+`_enable_options` exists there (names stored shifted left by one bit at
+`osos mem:0x080d6728`, `0x080d7874`, `0x080d89b4`; checks `0x080d7824`, `0x080d895c`).
+Preset 6 also writes a `.lum` side file. All three are Baseline level 3.0
+CAVLC: the entropy flag (host `310` bit 0) is 0 for every preset, so the
+firmware's CABAC path is never selected by the iPod OS. The dispatcher also
+defines other presets (up to 1280x720) that no caller selects.
+
+The host issues only commands 1 (header) and 2 (picture); the command word is
+written in one place (`osos mem:0x0813632c`, callers `0x0812cd84` and `0x0812d084`).
+Commands 4 (stop) and 5 (per-stream update) are never issued; the host stops
+the engine by reset. Stream indices 2..8 are never used. The program image is
+uploaded once per recording start; no other data is ever DMAed into the
+encoder and nothing is read back from its local RAM.
+
+A function-by-function walkthrough of the program, with start-up, every
+command handler, the call tree, the record layouts and experiments run on the
+image, is in [video-encoder-firmware.md](video-encoder-firmware.md).
 
 ## Firmware engine blocks, header writer, macroblock loop and rate control
 
@@ -235,7 +346,7 @@ macroblock type, se for QP deltas).
 | `+10` | R/W | macroblock address `ctx+0x2ac` written each macroblock; low 3 bits cleared at frame start | `0x4060`, `0x4084` | per macroblock, frame set-up |
 | `+14` | W | `P+0x08 \| P+0x0c<<16` (padded width and height in pixels) | `0x4084` | frame set-up |
 | `+20` | R | macroblock done (polled non-zero) | `0x1d88`, `0x3d04` | per macroblock |
-| `+30` | R/W | writer control: `0x32` at header start; `&0x1f` before flush and padding; `\|0x20` after final flush | `0xbec`, `0x25c`, `0xf3c`, `0xe8c` | header, end of frame |
+| `+30` | R/W | writer control: `0x32` at header start; `&0x1f` before flush and padding; `\|0x20` after final flush; bit 5 enables emulation-prevention bytes (start codes are written with it clear) | `0xbec`, `0x25c`, `0xf3c`, `0xe8c` | header, end of frame |
 | `+34` | R | ready flag for the data ports | `0x4374`, `0x3894` | all |
 | `+44` | R/W | **total bits written** (*inferred*: `&7` is the bit position in `0x528` and `0x1104`, `>>3` gives bytes in `0x19d4`); zeroed at each header NAL and at frame end | `0x68c`, `0x5c0`, `0xf3c`, `0x1104` | all |
 | `+48` | W | CABAC slice init: `P+0x40<<5 \| P+0x24<<3 \| mb_row<<15 \| mb_col<<8`; CAVLC macroblock: `skip<<7 \| cbp<<1 \| flag` | `0x352c`, `0x3d04` | slice, macroblock |
@@ -251,7 +362,9 @@ macroblock type, se for QP deltas).
 | `+c8` | W/R | handshake: write `1`, poll until `0`. Per macroblock fetch in `0x4060`; also at the last macroblock in `0x1104` | `0x4060`, `0x1104` | per macroblock, end of frame |
 | `+a8`, `+dc`, `+f0` | R | start-up and flush-done status (`+a8&0x1f` feeds host-side offset `010`; `+dc` and `+f0` polled in the final flush) | `0x2018`, `0x25c` | start-up, end of frame |
 
-Unknown: bit meanings of `+20`, `+50`, `+30` low five bits, `+dc`, `+f0`.
+Also accessed: `+60` read and written back unchanged at frame end, `+80` read once and discarded.
+
+Unknown: bit meanings of `+20`, `+50`, `+30` low five bits, `+60`, `+dc`, `+f0`.
 
 ### Block `0x00550000` : picture / macroblock pipeline parameters (inferred)
 
@@ -559,6 +672,25 @@ rate-control state of the stream**, not a report to the host. The host reads its
 
 The record is only used when rate control is on (`P+0xc4` or `P+0xc8`) and the bypass flag `ctx+0x288` is 0.
 
+## Firmware versions
+
+iPod OS 1.0.1 uploads a different encoder program: `0x4624` bytes instead of
+`0x4760`, with only 557 of the 1.0.2 program's 4,568 words unchanged. The
+command protocol is the same (doorbell `114`, command word `c0c`, abort flag
+`10c`; commands 1 header, 2 picture, 4 stop, 5 stream update). Differences seen
+from the encoder side:
+
+| | 1.0.1 program | 1.0.2 program |
+|---|---|---|
+| Stream indices accepted | 0..4 | 0..8 |
+| Host words `c00`, `c04` | read by the firmware at frame set-up | not read by the firmware |
+| Result word | writes `a04` | writes `a10` |
+| `514` bit 1 | not polled | polled until clear before a frame completes |
+| Rate control | integer arithmetic, table at `firmware 0x45f4`, no floating point | Qstep doubles and soft floating point |
+| Context | fields from `0x274` up sit `0x1c` higher; no pre-frame backup of P | backup in slots 4..7 |
+
+All other host registers the two programs use are the same.
+
 ## Finding ledger
 
 | Finding | Evidence | Type |
@@ -577,3 +709,14 @@ The record is only used when rate control is on (`P+0xc4` or `P+0xc8`) and the b
 | Rate-control formulas | `0x2104`, `0x1834`, `0x2628`, `0x26f8`, `0xf3c` | observed arithmetic, inferred names |
 | Result record is persistent state | `0x27d4`, `0x28fc`, `0x1834`, `0x18c4` | observed |
 | Slice mode (`31c`, `320`, `328`, `344`, `34c..3c8`) | `0x12a4`, `0x1550`, `0x19d4`, `0x1d88` | inferred |
+| Exception stubs jump through uninitialised RAM pointers `0x5fc4..0x5fe0` | `firmware 0x24..0xec` | observed |
+| ARMv4T code, no coprocessor or ARMv5+ instructions, software floating point | whole-image disassembly | observed |
+| Local RAM layout; at least 24 KiB | scatter table `0x474c`, heap `0x3528`, stacks `0x34f4`, vector literals | observed layout, inferred size |
+| Local RAM is 32 KiB and wraps at `0x8000` | test program write/read sweep | device |
+| Core starts only after host `108=1`, `134=1` | test program boot marker | device |
+| Mode 5 with a program-RAM `020` completes without moving data; mode 7 from the core hangs the device | test program | device |
+| DMA registers `000/008/00c/014/020/030` shared by host and firmware; mode 5 copies local to system memory | `osos mem:0x08136390`, `firmware 0xd60`, `0x1a7c`, `0x2018` | observed; direction semantics inferred |
+| Encoder used only by camera video recording (`VideoEncodeThread`) | `osos mem:0x080bb61c`, `0x0809c478`, `0x080eb810`; constant scans of all images | observed callers, bounded negative |
+| Presets 4/5/6 and their trigger files; all CAVLC Baseline 3.0 | `osos mem:0x080f4ea0`, `0x0812010c`, `0x080d7824`, `0x080d895c` | observed |
+| Host issues only commands 1 and 2; streams 0 and 1 only | `osos mem:0x0813632c`, `0x08113bdc`, `0x08113d1a` | observed |
+| 1.0.1 encoder program differs (`0x4624` bytes; stream indices 0..4; reads `c00/c04`; reports in `a04`) | 1.0.1 iPod OS image, program at body offset `0x6eac9c`, length word before it | observed |

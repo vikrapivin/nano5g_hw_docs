@@ -21,13 +21,15 @@ mode reads 5 bytes from 56 into offsets 1,2,4,5,6 and sets structure byte 0 to z
 
 The time write is **six separate one-byte writes**, 50 through 55 in order; the
 alarm write is **five**, 56 through 5a. The alarm transfer ends at 5a. The
-record looks like a calendar, but BCD/binary, day-of-week, epoch and
-month/year ranges are not traced.
+record uses six calendar fields. The bootloader GetTime mapping below
+establishes binary values and the 2000 epoch; neither path transfers a weekday.
+The hardware year range is not established.
 
 ## Bootloader RTC protocol
 
-GUID `e9a6aa07`, provider `bootloader DxeD1759.pe` (`+0x1488..0x14c8`, `+0x15cc..0x1614`, `+0x1418`).
-It uses a different layout from the disk functions above.
+GUID `e9a6aa07`, provider `bootloader DxeD1759.pe` (`+0x148c..0x14c8`, `+0x15cc..0x1614`, `+0x1418`).
+Its caller structure differs from the disk helper, but both use the same six
+calendar registers. GetTime copies the bytes directly without BCD conversion.
 
 | Operation | Behavior |
 |---|---|
@@ -48,6 +50,7 @@ Suspend/wakeup integration is not traced.
 | Finding | Evidence | Type |
 |---|---|---|
 | Byte offsets, read spans, write order | Disk functions above | observed (decompilation); no device RTC test |
+| Binary calendar with year offset 2000 | `bootloader DxeD1759.pe+0x148c` | observed; no device retention test |
 | Two bit 6 placements | `mem:0x080713f0` | observed; meaning unknown |
 | Structure offset 3 unused | `mem:0x080712ee` | observed (this helper only) |
 | Bootloader GetTime/SetTime: 12-byte block `50..5b`, `40` OR-ed into `56` | `bootloader DxeD1759.pe+0x1488..0x1614` | observed |
