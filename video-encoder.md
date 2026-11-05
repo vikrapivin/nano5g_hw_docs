@@ -71,7 +71,7 @@ Arguments keep the original packing; unnamed ones are not decoded.
 | `334`, `338` | reference-write plane 0 and plane 0 + padded_width*padded_height |
 | `33c`, `340` | reference-read planes in the same layout |
 | `348` | metadata address OR `80000000` (bit 31 is an enable, not an alias-removal bit) |
-| `34c..3c8` | 32 matrix words, 4-byte stride |
+| `34c..3c8` | 32 matrix words, 4-byte stride; on the device words 0..3 keep 12 bits and word 4 keeps 8 (values written by the host, read by the core) |
 | `3cc`, `3d0` | `(enable<<31)\|value` |
 | `3d4` | `(repeat<<1)\|mode` |
 | `800`, `804` | input planes |
@@ -112,10 +112,10 @@ Clock entry `mem:0x08551db0` enables masks `80` at `0x3c500058` and `30000` at
 The six-slot delayed pipeline and session lifetime are host software above
 the engine. Not known: physical throughput, fault-bit meanings, the engine
 fields listed as unknown in the firmware sections, the embedded processor's
-core type and clock, the meaning of DMA modes 3 and 7 (7 hangs the device bus when
-started from the core),
-whether the embedded processor can start a system-to-local copy, and whether
-its load/store unit can reach any address outside the encoder.
+core type and clock, the width of matrix words 5..31, the meaning of DMA
+modes 3 and 7, what each mode does with a valid system address, whether the
+embedded processor can start a system-to-local copy, and whether its
+load/store unit can reach any address outside the encoder.
 
 ## Embedded firmware
 
@@ -242,22 +242,27 @@ never writes `008`. Observed in both images; that `008` selects the direction is
 inferred from the firmware writing `5` only for copies whose data flows from
 table RAM to a host-supplied address.
 
-**Device tests with a test program in the core** (first runs; the program was
-uploaded by the host sequence above):
+**Device tests with a test program in the core** (the program was uploaded by
+the host sequence above). The test program took its arguments from the matrix
+words `34c..`; the host wrote 32-bit values and the core read back only the
+low 12 bits of words 0..3 and the low 8 bits of word 4. Every system address
+in the DMA rows below therefore reached `014` as the low 12 bits of the
+intended buffer address, inside the first 4 KiB of the system address space.
+Those rows record what the engine does with such an address, not with a
+valid buffer:
 
 | Test | Result | Type |
 |---|---|---|
 | Start-up | the core did not reach its first marker within 500 ms after the upload; it started once the host wrote `108=1` and `134=1` | device |
 | Local RAM | writes at `0x8000` read back at `0x0000`: 32 KiB, wrapping | device |
-| `008=5`, `020` = an address in the core's own RAM (`0x3400`), 8 words | `030` reads 1, but none of the 8 words reached system memory | device |
-| `008=3,0,1,2,6`, `020` in the core's RAM | `030` never read 1 within 200,000 polls | device |
-| `008=4`, `020` in the core's RAM | `030` read 1; the core's buffer did not receive the system data | device |
-| `008=7` | the whole device stopped responding (no further screen update, hard reset needed); twice | device |
+| Matrix words | host wrote `11111111..55555555` to words 0..4, the core read `111, 222, 333, 444, 55`; loop counts `0x4e20`, `0x30d40` arrived as `e20`, `d40`, and loop times scaled with the truncated counts | device |
+| `008=5`, 8 words, `020` = core RAM `0x3400` or table RAM `0x600000`; `014` truncated | `030` reads 1; the intended buffer is unchanged | device |
+| `008=3,0,1,2,6`, `020` in core RAM, `014` truncated | `030` never read 1 within 200,000 polls | device |
+| `008=4`, `020` in core RAM, `014` truncated | `030` read 1; the core's buffer did not receive the intended data | device |
+| `008=7`, `020` in core RAM, `014` truncated | the whole device stopped responding (no further screen update, hard reset needed); twice | device |
+| `008=3`, `020` = table RAM `0x600000`, `014` truncated | the whole device stopped responding; once | device |
 
-Together with the program's use of table-RAM addresses only, this indicates that
-`020` addresses the encoder's own bus (table RAM `0x600000`), not the core's
-program RAM (inferred). Mode 7 is not safe to start from the core with these
-register values.
+The original program uses table-RAM addresses only for `020` (observed).
 
 ## Use by the iPod OS
 
@@ -714,7 +719,8 @@ All other host registers the two programs use are the same.
 | Local RAM layout; at least 24 KiB | scatter table `0x474c`, heap `0x3528`, stacks `0x34f4`, vector literals | observed layout, inferred size |
 | Local RAM is 32 KiB and wraps at `0x8000` | test program write/read sweep | device |
 | Core starts only after host `108=1`, `134=1` | test program boot marker | device |
-| Mode 5 with a program-RAM `020` completes without moving data; mode 7 from the core hangs the device | test program | device |
+| Matrix words 0..3 hold 12 bits and word 4 holds 8 | test program echo of host-written values | device |
+| With `014` in the first 4 KiB: mode 5 completes, modes 0..3 and 6 time out, modes 7 (`020` core RAM) and 3 (`020` table RAM) hang the device | test program | device |
 | DMA registers `000/008/00c/014/020/030` shared by host and firmware; mode 5 copies local to system memory | `osos mem:0x08136390`, `firmware 0xd60`, `0x1a7c`, `0x2018` | observed; direction semantics inferred |
 | Encoder used only by camera video recording (`VideoEncodeThread`) | `osos mem:0x080bb61c`, `0x0809c478`, `0x080eb810`; constant scans of all images | observed callers, bounded negative |
 | Presets 4/5/6 and their trigger files; all CAVLC Baseline 3.0 | `osos mem:0x080f4ea0`, `0x0812010c`, `0x080d7824`, `0x080d895c` | observed |
