@@ -262,6 +262,21 @@ valid buffer:
 | `008=7`, `020` in core RAM, `014` truncated | the whole device stopped responding (no further screen update, hard reset needed); twice | device |
 | `008=3`, `020` = table RAM `0x600000`, `014` truncated | the whole device stopped responding; once | device |
 
+With the arguments sent in 11-bit pieces and echoed back whole, so that `014`
+held the intended SDRAM buffer address:
+
+| Test | Result | Type |
+|---|---|---|
+| Matrix words | all 32 words read back 12 bits from the host; values sent in 11-bit pieces arrive whole | device |
+| Clock | single loops: 98 M ALU, 51 M load, 34 M multiply instructions per second | device |
+| Host programs `008` (untouched, 3, 0, 1, 2, 4, 6), `00c`, `014` in SDRAM, `020` in core RAM or table RAM, `000=1`, with or without `110=1` | nothing arrives at `020`; with `110=1` the event bit 7 is raised; table RAM with `110=1` stopped the core | device |
+| Core reads SDRAM addresses `0x083b2200`, `0x883b2200`, `0x283b2200`, `0x483b2200` | each returns the word at local `0x2200` (the same as `0x003b2200`) | device |
+| `008=5`, 8 words, `020` = table RAM `0x600000`, `014` in SDRAM | `030` reads 1; the SDRAM buffer is unchanged | device |
+| inbound `008` = 3, 0, 1, 2, 6, 32-word chunks, `020` = table RAM `0x600000`, `014` in SDRAM | `030` never reads 1 within 200,000 polls | device |
+| inbound `008=4`, same | `030` reads 1; the local buffer does not hold the SDRAM data | device |
+| host closes the engine (`10c=0`, `134=0`, `130=1`, `130=0`, `108=0`, `048=1`, `508=1`, clocks gated) after inbound transfers timed out | on four of eight runs the whole device stopped responding (hard reset needed) | device |
+| original program, preset 5: header command, one 64x64 frame, commands 5 and 4 | completes and writes its output to the SDRAM ring | device |
+
 The original program uses table-RAM addresses only for `020` (observed).
 
 ## Use by the iPod OS
@@ -457,7 +472,30 @@ Vector words (`0x1b5c`): word 0 `(type&7)<<28 \| (v20&0x3ff)<<16 \| v30&0x1ff`; 
 Intra and skipped macroblocks get `intra<<31 \| skip<<15` instead (P pictures only); other types get 0.
 `0x1c4c` ships a full row (`0x280` bytes = 40 macroblocks x 16) through the `0x500000` DMA registers to
 `host c08[30:0] + row*0x280`, enabled by host `c08` bit 31. The table in `0x600004..` goes out at end of frame through
-`0xd60` to the address in host `348[30:0]`.
+`0xd60` to the address in host `348[30:0]`. Before that copy `0xd60` issues 40 identical 2-word
+mode-5 transfers from `0x600000` to the same address, each polled until `030` reads 1 (`firmware 0xd60`, observed).
+The program's only other engine start is in `main` (`firmware 0x2018`): `008=3`, `000=1` with the length and
+addresses the host's upload left in `00c/014/020`, not polled, before the command loop; every mode-5 transfer
+follows it. The test program in the core started no such transfer in the device tests above.
+
+A test program in the core that starts the writer stream the same way (`008=3`, `000=1`), sets the writer
+up as `0xbec` does and writes 97 bits gets them, padded to 32 bytes, into the host's ring: the ring holds
+the written bytes and the cursor `034` advanced by `0x20` (device). The same program's mode-5 copies
+from `0x600000` complete (`030` reads 1) and deliver nothing, alone, after 40 warm-up copies and after
+the recording session's host register setup; a scan of all SDRAM finds the pattern nowhere, and the host
+then reads back the values of its own upload in `00c/014/020/008` (device). The original program's own
+mode-5 copy of the slice-statistics table does arrive: 130 of 136 poisoned words at host `348[30:0]`
+change after one frame (device).
+The program's bitstream reaches SDRAM through the writer: bits go to `0x520038..0x520040`, the
+writer's FIFO level is `03c`, its output DMA state `038` (`0x80` idle, waited for after a flush,
+`firmware 0x25c`), and the bytes land in the ring at `018..01c` with the cursor at `024/034`. A stop
+request (`10c != 0`) is taken as command 4 by the command wait (`firmware 0x1f08`): the program frees its
+context, writes `510=1` and spins forever (`firmware 0x1e8c`); `main`'s code after the command loop (`010`,
+mode 7, `510`) is never reached (observed).
+The flush's second argument skips the `5200dc` wait: the header path passes 1 (`firmware 0xcfc`), the end of
+frame 0 (`firmware 0x1078`); after a header-only flush `5200dc` reads 0 (device). A test program that answers
+`10c` the same way (`510=1`, then no further bus access) was opened and closed 22 times in one run, the host
+waiting for `514` bit 5 before gating the clocks, without the device stopping (device).
 
 ## Header writer
 
@@ -726,3 +764,7 @@ All other host registers the two programs use are the same.
 | Presets 4/5/6 and their trigger files; all CAVLC Baseline 3.0 | `osos mem:0x080f4ea0`, `0x0812010c`, `0x080d7824`, `0x080d895c` | observed |
 | Host issues only commands 1 and 2; streams 0 and 1 only | `osos mem:0x0813632c`, `0x08113bdc`, `0x08113d1a` | observed |
 | 1.0.1 encoder program differs (`0x4624` bytes; stream indices 0..4; reads `c00/c04`; reports in `a04`) | 1.0.1 iPod OS image, program at body offset `0x6eac9c`, length word before it | observed |
+| With a test program in the core no DMA form moves data between SDRAM and the core; closing the engine after timed-out inbound transfers can stop the whole device | device tests with a test program in the core | device |
+| Bits a test program writes after the stream start (`008=3`, `000=1`) reach the host's ring; its mode-5 copies do not reach SDRAM; the original program's mode-5 statistics copy does | device tests; `firmware 0x2018`, `0xd60`, `0x25c` | device |
+| Header flush skips the `5200dc` wait (argument 1); end of frame waits | `firmware 0xcfc`, `0x1078`, `0x25c` | observed; device |
+| Answering `10c` with `510=1` and no further bus access, and the host waiting for `514` bit 5 before gating clocks, closes the engine without stopping the device | device test, 22 closes | device |
