@@ -16,6 +16,10 @@ port 11.2. Init selects function 2. Wire roles are in the
 [bit-bang table](#bit-bang-wire-protocol-bootloader). Apple restore gate ID 50 is `PWRCON1 bit1`.
 The OS wheel interrupt is VIC 23. Hold is a PMU input, separate from the packet
 stream: PMU register 5 bit 0 set means switch released, clear means hold engaged.
+On a hold change the OS (`osos mem:0x0819c3f0`, first evaluation `0x081988fc`) drives pins `0x59` then `0x57`
+low while held (wrapper `gpio_pin_config(pin, 1, 0)`, which writes cfg `0xe`; `osos mem:0x0818fe8c`) and returns
+`0x57` then `0x59` to function 2 on release; the controller registers and its clock are left running. Its
+power-off path (`osos mem:0x0819f540`) touches no wheel pin or register.
 
 All accesses are 32-bit words at `W=0x3c200000`.
 
@@ -189,7 +193,8 @@ The `0x3a980` timing word and the unexplained control bits are kept as observed.
 |---|---|---|
 | Init, TX encoding and exchange waits | OSOS `0x081bf9f0/0x0801ea98/0x0801db18` | observed |
 | IRQ 23 and packet formats | OSOS `0x080005f0/0x08000534` | observed; not the full controller protocol |
-| Hold polarity and pin restore | OSOS `0x0819c3f0/0x081988fc` | observed |
+| Hold polarity and pin restore; held = pins `0x59`, `0x57` cfg `0xe` (output low), released = `0x57`, `0x59` function 2 | OSOS `0x0819c3f0/0x081988fc`, wrapper `0x0818fe8c` | observed |
+| Power-off leaves the wheel controller, its clock and pins as they are | OSOS `0x0819f540` | observed |
 | Read then acknowledge; reading RX does not clear `WHEEL0C` bit 0 | Stock ISR; device runs above (drain loop hangs, one-read driver works) | device |
 | Register read `0x8000003a\|r<<8`, write `0x8000002a\|r<<8\|v<<16`; reg 0 vendor, reg 1 firmware | `diag Twif.pe+0x40c,+0x608,+0x448` | observed |
 | Vendor IDs `0x104` Cypress, `0x1288` Synaptics | `diag TestClickWheelUpdate.pe+0xe02..0xe4e` | observed |

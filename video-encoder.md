@@ -643,12 +643,28 @@ follows it. The test program in the core started no such transfer in the device 
 
 A test program in the core that starts the writer stream the same way (`008=3`, `000=1`), sets the writer
 up as `0xbec` does and writes 97 bits gets them, padded to 32 bytes, into the host's ring: the ring holds
-the written bytes and the cursor `034` advanced by `0x20` (device). The same program's mode-5 copies
-from `0x600000` complete (`030` reads 1) and deliver nothing, alone, after 40 warm-up copies and after
-the recording session's host register setup; a scan of all SDRAM finds the pattern nowhere, and the host
-then reads back the values of its own upload in `00c/014/020/008` (device). The original program's own
-mode-5 copy of the slice-statistics table does arrive: 130 of 136 poisoned words at host `348[30:0]`
-change after one frame (device).
+the written bytes and the cursor `034` advanced by `0x20` (device). Mode-5 copies land in SDRAM with each
+32-bit word byte-swapped (the engine stores words big-endian): a two-word copy issued at nine points of a
+reimplementation of the program, from `main` right after the stream start to the end of the frame, lands
+at every point in that order (device); copies that looked undelivered when read in the host's byte order
+were all present. After a mode-5 copy the host reads back its own values in `00c/014/020/008`, while the
+core reads back the ones it programmed: host and core keep separate copies of these registers (device).
+The original program's slice-statistics copy arrives (130 of 136 poisoned words at host `348[30:0]` change
+after one frame) (device).
+
+Host DMA into the core's RAM (`000` with `00c/014/020` from the host) lands while the core is stopped
+(stop request answered, with or without the disable that follows) and inside the `110` bracket the program
+upload uses; without the bracket, or into a running core, nothing arrives (device). No DMA event is raised
+for such a transfer. 8 KiB take between 250 and 500 µs (none of 2048 words after 100 µs, 2047 after
+250 µs, all after 500 µs); a core restarted immediately after the start holds only the first 80 words.
+Host DMA with the `110` bracket into a running core lost the core in one run and stopped the whole device in
+another (device). Restarting a stopped core (`134` cleared, `130` pulsed, `108` cleared, then `108=1`, `134=1`)
+runs it again from its reset vector with its RAM kept (device).
+Raw 32-bit words written through the raw-bit port after a writer flush come out one bit late: the ring holds
+a leading 1 bit and then the words (`0x0bad5540` arrives as `85 d6 aa a0`); 16 KiB written that way take
+1.7 ms once the stream runs, and with emulation prevention on the writer counts 1024 escape bytes for that
+data and writes 1024 more bytes (device). The original program starts every NAL with a start code; a start
+code written into a fresh stream comes out aligned (device).
 The program's bitstream reaches SDRAM through the writer: bits go to `0x520038..0x520040`, the
 writer's FIFO level is `03c`, its output DMA state `038` (`0x80` idle, waited for after a flush,
 `firmware 0x25c`), and the bytes land in the ring at `018..01c` with the cursor at `024/034`. A stop
@@ -957,7 +973,13 @@ All other host registers the two programs use are the same.
 | Host issues only commands 1 and 2; streams 0 and 1 only | `osos mem:0x0813632c`, `0x08113bdc`, `0x08113d1a` | observed |
 | 1.0.1 encoder program differs (`0x4624` bytes; stream indices 0..4; reads `c00/c04`; reports in `a04`) | 1.0.1 iPod OS image, program at body offset `0x6eac9c`, length word before it | observed |
 | With a test program in the core no DMA form moves data between SDRAM and the core; closing the engine after timed-out inbound transfers can stop the whole device | device tests with a test program in the core | device |
-| Bits a test program writes after the stream start (`008=3`, `000=1`) reach the host's ring; its mode-5 copies do not reach SDRAM; the original program's mode-5 statistics copy does | device tests; `firmware 0x2018`, `0xd60`, `0x25c` | device |
+| Bits a test program writes after the stream start (`008=3`, `000=1`) reach the host's ring | device test; `firmware 0x2018`, `0x25c` | device |
+| Mode-5 copies land with each 32-bit word byte-swapped (big-endian), from boot on; host and core keep separate DMA register copies | device tests (reimplementation of the program with marker copies; core and host read-back) | device |
+| Host DMA into the core's RAM lands while the core is stopped and inside the `110` bracket, without a DMA event; 8 KiB in 250..500 µs; restart keeps RAM | device tests | device |
+| Host DMA with the `110` bracket into a running core loses the core or stops the device | device tests | device |
+| Mode-5 copies byte-swapped by the core before the copy arrive in the host's order, in every size up to 1024 words | device test | device |
+| After a writer flush, raw bits written next come out one bit late (a leading 1 bit) | device test | device |
+| The core is an ARM7TDMI-class CPU without CP15 (MRC p15 returns the prefetched instruction word); CP14 debug comms present (`0x70000000`) | device test | device |
 | Writer ports: raw bits wait `+34 != 0`, Golomb waits `+34 == 1`; raw-bit order `+40`, `+3c`, `+38`; kick polls `+50`/`+20` never cleared by the program; `+00` sequence at header, frame and slice set-up | `firmware 0x4374`, `0x3874`, `0x3894`, `0x3d04`, `0x38b0`, `0x4084`, `0x352c` | observed |
 | Flush order, `038` second read only if the first is not `0x80`, `+dc` skipped when the second argument is 1 | `firmware 0x25c`, `0xcfc`, `0x1078` | observed |
 | Header flush skips the `5200dc` wait (argument 1); end of frame waits | `firmware 0xcfc`, `0x1078`, `0x25c` | observed; device |

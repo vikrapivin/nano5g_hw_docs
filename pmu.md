@@ -192,6 +192,12 @@ Standby / power-off (`diag SystemPowerManagement.pe+0x922..0x9d4`, `+0xa32..0xa4
 clear bits 7:6 of `36`, clear bits 7:6 of `37`, clear bit 0 of `0c`, clear bit 4 of `0e`,
 clear bit 6 of `5a`, write `0a = 01`, spin.
 
+OSOS power-off (`osos mem:0x0819f540`, same code as `disk mem:0x08056592`): take the PMU bus lock, `31 = 02`,
+`0a = 01`, release the lock; no GPIO, wheel or clock-gate access and no wake set-up in the path. The wake
+configuration is the one left by start-up (`osos mem:0x08010874`: `22 = 05`, `07..09 = 10 fe 2b`,
+`01..03 = ff`). Callers: the UI hold/event dispatcher (`osos mem:0x0819c400`, event bit 0, only without
+external power) and `osos mem:0x081c3934` (observed).
+
 `TestSleep` (`diag TestSleep.pe`): `-d` deep sleep = backlight off, 0.5 s delay (`0x7a120` µs), `0a |= 1`;
 `-h` hibernate = same with `0a |= 2`; `-s` returns without PMU writes (`+0xb1c..0xb7e`).
 `stbpmu` (`+0xc2e..0xcd0`): after hold is engaged, regs `01, 02, 03 = ff`, then `07 = 90`, `08 = 80`, `09 = 00`,
@@ -245,6 +251,7 @@ Backlight (diag brightness path through the single-wire block) is described in [
 | Reg 32 PMU-GPIO command encoding | `bootloader DxeD1759.pe+0x1540` | observed; pin 7 role unknown |
 | Accessory 3.3 V (`1e = 10`, reg 10 bit 7) | `diag TestAccsw.pe+0xbac..+0xcb0` | observed |
 | Rail nibbles `0b..0f` | `diag DxeD1759Diagnostic.pe+0x5c8` | observed (layout); meaning unknown |
+| OSOS power-off: bus lock, `31 = 02`, `0a = 01`, nothing else; wake set-up left from start-up (`22 = 05`, `07..09 = 10 fe 2b`) | `osos mem:0x0819f540`, `0x08010874` | observed |
 
 ## Not resolved
 
