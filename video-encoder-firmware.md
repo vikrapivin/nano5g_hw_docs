@@ -116,6 +116,7 @@ do {
 - Stream indices 9 and above, and commands 6 and above, are not accepted: the loop keeps polling with the last values
   (dynamic: stream 9 with command 1 left the core spinning in `0x1f08..0x1f77` with no output).
 - Commands 0 and 3 are accepted and ignored: `command_loop` has no case for them, `50c` is not written, the loop polls again.
+- `c0c` is read twice per pass (stream from bits 15:8, then command from bits 7:0), and the acceptance test is signed (`stream <= 8 && command <= 5`).
 
 `command_loop` dispatch (`switch`):
 
@@ -143,23 +144,25 @@ merge stub and body; the bodies are separate entries here (`0x18c4`, `0x0bec`).
 | 5 | bs `+30 = 0x32`, `+44 = 0`, `+78 = 0`, `+b4 = 0`; `ctx+0x2d8 = ctx+0x2dc = 0` | writer in raw-bit mode with emulation prevention (bit 5) enabled, counters cleared |
 | 6 | `compute_geometry`, `write_sps`, `write_pps` | NAL 0x67 then NAL 0x68; see the syntax tables in [video-encoder.md](video-encoder.md#header-writer); each ends in `bs_trailing_bits` |
 | 7 | host `a08 = ((sps_bits >> 3) << 16) + (pps_bits >> 3)` | the two NAL lengths in bytes |
-| 8 | if `ctx+0x288 == 0`: `rate_defaults_init`; and if `P+0xc4 \| P+0xc8`: `rate_init_targets` | rate-control defaults and targets (see [Rate control](#rate-control-functions)) |
+| 8 | if `ctx+0x288 == 0`: `rate_defaults_init`; and if `P+0xc4 \| P+0xc8`: `rate_init_targets` | rate-control defaults and targets (see [Rate control](#rate-control-functions)); `rate_init_targets` receives the `P` pointer, left in `r1` by the load at `0xc8c` (the callee stores it in `ctx+4`), not the stream, while `rate_state_store` gets the stream |
 | 9 | `stream_slot_store(ctx, stream)` | P saved into slot `stream` |
 | 10 | if rate control on and not bypassed: `rate_state_store(ctx, stream)` | result record `stream` written |
 | 11 | host `a0c = (sps_bits + pps_bits) >> 3` | header byte count |
-| 12 | `bs_flush_and_wait(ctx, 1)` | 32 one-bits plus alignment filler, padding to an 8-word burst, `+30` bit 5 set, wait for `+dc == 1` and `+f0 == 0` |
+| 12 | `bs_flush_and_wait(ctx, 1)` | 32 one-bits plus alignment filler, padding to an 8-word burst, `+30` bit 5 set, wait for `+f0 == 0`; the second argument 1 skips the `+dc == 1` wait (the end-of-frame flush passes 0 and waits for both; order of the flush in [video-encoder.md](video-encoder.md#block-0x00520000--bitstream-writer-and-entropy-coder-inferred)) |
 | 13 | host `50c = 1` | command complete |
 
 `write_sps` and `write_pps` write through `bs_put_bits` and `bs_put_ue`/`bs_put_se`. Observed outputs (dynamic) for the preset
 register images the iPod OS uses (640x480, 30 fps) are in [Dynamic analysis](#dynamic-analysis): the bytes decode as a valid
 Baseline level 3.0 SPS and PPS.
 
-Two properties the older notes did not record:
+Properties the older notes did not record:
 
 - `profile_idc` values other than 0, 1, 2 (host `300[1:0] = 3`) make `write_sps` **skip the 16-bit profile and constraint field entirely**
   (static: the three-way test falls through to the next write); the SPS is then malformed (dynamic experiment C, 11-byte SPS whose
   second byte is `level_idc`).
 - The SPS is the same for CAVLC and CABAC; only the PPS entropy flag differs (`0x19` vs `0x1d` in the first five PPS bits).
+- `P+0x20 level_idc` is host `300 >> 2` without a mask and `write_sps` sends 8 bits, so bits above 8 of `300` stay in `P`. `P+0x50` and `P+0x54` both get host `330[11:8]`; `P+0x5c` keeps its default 0. `P+0x2c slice_qp` is not loaded from the host: `write_pps` sets it to `init_qp`. `profile == 2` is tested a second time for the 7-bit High-profile block.
+- `stream_params_defaults` does not clear `crop_x/crop_y` or the padded sizes; they are stale when the new size is aligned, and then `crop_flag` (cleared by the defaults, set only by `compute_geometry`) keeps them unused. `write_pps` ignores its second argument (0). `HOST+a08` uses `>> 3` per NAL, `a0c` uses `(sps + pps) >> 3`; both are exact because the trailing bits align each NAL.
 
 ## Command 2: picture
 
@@ -186,7 +189,7 @@ if (rate control on && !bypass) rate_state_store(ctx, stream)
 2. `stream_slot_load(ctx, ctx+0x290)` copies slot -> P.
 3. if rate control is on and not bypassed: `rate_state_load` (restores the 21-word state, rewrites picture engine `+160..+17c`).
 4. `reload_frame_params` (`0x3b88`) re-reads host `31c..348`, `3cc/3d0/3d4`, `900`, `914`, `c08`, `314`. If host `900` bit 9 is set without bit 8,
-   it also sets `P+0xdc = 1` and `P+0xc8 = 1` (the engine rate flag is forced on).
+   it also sets `P+0xdc = 1` and `P+0xc8 = 1` (the engine rate flag is forced on). The `byte_thr` clamp tests the N flag of `324 - 0x780`; `vec_dump_en` is `c08 & 0x80000000` (not shifted) and `c08` is read twice. The complete list of host registers read per command is in [video-encoder.md](video-encoder.md#embedded-firmware).
 5. `frame_type_select` (`0x1610`): type 2 (IDR) when `P+0xbc == 0` (first frame), when the period is 0, or when the
    frame counter `P+0xb8` equals `period + 1`; otherwise type 1 (P). Host `3d4` bit 0 overrides with the type in bits 2:1. Type 2 resets
    `P+0xb8` to 0. `ctx+0x2a0 = (type == 1)`.
@@ -225,6 +228,8 @@ if (rate control on && !bypass) rate_state_store(ctx, stream)
 engine supplies, `bs+0c` code mode 2 (intra) or 3 (inter) for the coded block pattern when it is not implied, `mb_qp_delta` as se, `bs+48/+4c`, kick 4.
 Intra 4x4 prediction modes come from the engine on kick `0x80` (only I_NxN). The intra chroma prediction mode is written as ue after the kick.
 
+Where the disassembly differs from the decompiler listing (disassembly wins): `mb_qp_delta` is written when `cbp != 0`, or the slice type is 0 or 2 with `mb_type != 0`, or a P macroblock has `mb_type - 6 < 0x18` (unsigned), not for every type 0; `write_mb_type` reads the type class on the inter path, overrides the type with `S.mb_type` for intra macroblocks of P pictures, maps type 3 to 4 when `ref_count == 0`, and ends with a tail branch to `bs_put_ue` after kick `0x80` (chroma mode last); after the end marker (`MBREC(0) == 0xffffffff`, read once) both macroblock loops jump to their epilogue; `mb_advance` compares `byte_thr` unsigned with `bs+44 >> 3` and `mb_addr < mb_count - 5` signed; `slice_type_select` shifts by a register, so a slice number of 32 or more tests as 0; `slice_limit_setup` in mode 1 writes only `P+0x7c = 0x7fffffff` (slice count `>= 0x1f`, signed) and never picture engine `+14`, other modes than 0, 1, 2 write nothing, and modes 0 and 2 write `0xfff` for slice count `>= 0x1f` or limit 0; `cabac_zero_words` divides (`__rt_sdiv`, `(bs+6c + 2) / 3`) before testing `n <= 0` and returns either way; the CABAC statistics word of `slice_close` is stored at `0x5ffffc + 16 * slice_count` (literal `0x1100`, one word below table RAM for slice count 0); the stats padding loop writes five words per index (`+4..+0x14`), the fifth overlapping the next record, and for index 31 reaching `0x600204`.
+
 **Frame end** (`frame_end`, `0x0f3c`): host `918 = pic+158 & 0x3f`; for CABAC `cabac_zero_words` (`ceil((bs+6c + 2)/3)` units of `00 00 03`, added to
 the bit totals as `n*0x18`); bit totals; optional minimum-size padding (zero bytes until host `3d0[30:0] >> 3` bytes, with `bs+30 &= 0x1f` so the filler is not escaped);
 host `a0c = frame_bits >> 3`, `a10 = a0c - padding`; `bs_flush_and_wait(ctx, 0)`; if not bypassed: `rate_buffer_update` (rate A) and `rate_thresholds_update`;
@@ -234,7 +239,7 @@ host `a0c = frame_bits >> 3`, `a10 = a0c - padding`; `bs_flush_and_wait(ctx, 0)`
 `P+0xb8++`, `P+0xbc++`.
 
 Latent limit (static): the backup store uses slot `stream + 4` and the slot array has eight slots, so only streams 0..3 stay inside the array;
-`command_wait` accepts streams up to 8. The result-record array (eight records) is exceeded by stream 8. The iPod OS uses streams 0 and 1 only.
+`command_wait` accepts streams up to 8. The slot array is `0x2c0` bytes, so `stream_slot_store(stream + 4)` writes beyond it for streams 4..8, and stream 8 also overruns the `0x2a0`-byte result-record array. The iPod OS uses streams 0 and 1 only.
 
 ### Rate control functions
 
@@ -245,11 +250,12 @@ Described in [video-encoder.md](video-encoder.md#rate-control); the functions ar
 the conversion); `rate_thresholds_update` then evaluates `0x3000 / (2 * (int) Qstep)` with signed division. **For QP 0..3 `(int) Qstep` is 0 and the division raises SIGFPE**
 (dynamic experiment F). The library's default signal handler prints the message through the semihosting `SWI 0x123456`. On silicon that SWI enters the exception vector
 and jumps through the RAM word at `0x5fc8`, which no code in the image initialises. The shortcut `avg == 0x10` (statistic at the floor) avoids the division.
+Other traps and quirks (disassembly): `rate_init_targets` faults for host `904 == 0` or `mb_count == 0`; `qp_to_qstep` with a negative remainder would index before the table (unreachable, slice QP is masked to 0..63); `rate_state_load` reads record `+0x40` twice (for `mb_stat_thr` and `mb_stat_thr2`) and never loads `+0x44`; in `rate_buffer_update` the N flag of the add (not a signed compare) clamps the level to 0 and the `p_since_i` tests are unsigned; the fourth argument of `frame_rate_window_update` is `P->frame_count` and the engine QP (`+140`) is read back only when above 0; `rate_init_targets` with `idr_period == 0` uses divisor 9 and numerator 6 times the I target. The divisions are `__rt_sdiv` / `__rt_udiv` (`/` and `%` in the sources of each routine: `h908/0x73`, `h908/h904`, `h908/(h904<<3)`, the I/P target divisions, the buffer level `/0x1d1`, `q3/mb_count`, `q2*0x24/1000000`, `0x78/k`, `stat/mb_count`, `0x3000/(2*q)`).
 
 ## Commands 0, 3, 4 and 5
 
 - **0, 3:** ignored (see above).
-- **4** (`cmd4_teardown`, `cmd4_halt`): if the context pointer is non-null, `ctx_destruct` frees the slot array and the result records, `operator_delete` frees the context.
+- **4** (`cmd4_teardown`, `cmd4_halt`): if the context pointer is non-null, `ctx_destruct` frees the slot array and the result records, `operator_delete` frees the context. `ctx_destruct` does not clear `slot_array`, `result_records_free` frees `ctx[0]` unconditionally, and `ctx_construct` does not check its allocations.
   The pointer word at `0x475c` is not cleared. Then host `510 = 1` and `b .` at `0x1e98`. Nothing returns to the loop; the host resets the engine. Dynamic: `10c != 0` with any
   command posted reaches the same loop with no frame produced.
 - **5** (`cmd5_stream_update`): `cmd5_set_bypass(ctx, stream_byte)`: `ctx+0x288 = stream_byte` and host `50c = 1`, then host `a00 = 0xbad0cafe`. The stream index
@@ -563,7 +569,7 @@ All structures are in the heap and are addressed through the context pointer sto
 | `+0xa8` | `slot_array` | pointer to 8 stream slots of `0x58` bytes (`0x2c0` bytes) |
 | `+0xac` | `S` | inline per-macroblock record, `0xe0` bytes |
 | `+0x18c` | `P` | inline per-stream parameter record, `0xe8` bytes |
-| `+0x274` | `cur_slot` | pointer to the current slot |
+| `+0x274` | `cur_slot` | pointer to the current slot; written by `ctx_select_stream` and never read (`ctx+0x28c` is only zeroed by `ctx_construct`) |
 | `+0x278`, `+0x27c` | `S_ptr`, `P_ptr` | pointers to S and P (the code always goes through them) |
 | `+0x280`, `+0x284` | `mb_handler`, `mb_handler_adj` | pointer-to-member for the entropy handler |
 | `+0x288` | `bypass` | command 5 flag |
@@ -591,15 +597,15 @@ All structures are in the heap and are addressed through the context pointer sto
 | `+0x08`, `+0x0c` | `padded_width`, `padded_height` | `mb_width*16`, `mb_height*16` |
 | `+0x10`, `+0x14` | `crop_x`, `crop_y` | `(padded - size) >> 1` (2-pixel units) |
 | `+0x18` | `idr_period` | host `308` |
-| `+0x1c`, `+0x20` | `profile`, `level_idc` | host `300[1:0]`, `300 >> 2` |
+| `+0x1c`, `+0x20` | `profile`, `level_idc` | host `300[1:0]`, `300 >> 2` (no mask; `write_sps` sends 8 bits) |
 | `+0x24` | `entropy_flag` | host `310` bit 0 |
 | `+0x28` | `host810` | host `810` |
-| `+0x2c`, `+0x30` | `slice_qp`, `init_qp` | current QP; host `900[5:0]` |
+| `+0x2c`, `+0x30` | `slice_qp`, `init_qp` | current QP (not loaded from the host; `write_pps` sets it to `init_qp`); host `900[5:0]` |
 | `+0x34`, `+0x38`, `+0x3c` | `mb_count`, `mb_width`, `mb_height` | |
 | `+0x40` | `p40` | default 1; CABAC init word field |
 | `+0x44` | `cabac_init_idc` | host `310[3:2]` |
 | `+0x48`, `+0x4c` | `force_type_en`, `forced_type` | host `3d4` |
-| `+0x50`, `+0x54`, `+0x58`, `+0x5c` | `max_refs_m1`, `num_ref_active_m1`, `ref_cfg_en`, `ref_count` | host `330` |
+| `+0x50`, `+0x54`, `+0x58`, `+0x5c` | `max_refs_m1`, `num_ref_active_m1`, `ref_cfg_en`, `ref_count` | host `330` (`+0x50` and `+0x54` get the same field `[11:8]` at header time; `+0x5c` is derived per frame) |
 | `+0x60` | `ref_base` | host `80c` |
 | `+0x64`, `+0x6c`, `+0x70` | `deblock_idc`, `alpha_off`, `beta_off` | host `314` |
 | `+0x74`, `+0x78`, `+0x7c`, `+0x80` | `slice_mode`, `limit_mode`, `byte_thr`, `slice_limit` | host `31c`, `320`, `324 - 0x780`, `324` |
@@ -608,7 +614,7 @@ All structures are in the heap and are addressed through the context pointer sto
 | `+0x90`, `+0x94` | `stats_en`, `stats_addr` | host `348` |
 | `+0x98` | `frame_bits_rate` | frame bits handed to `rate_buffer_update` |
 | `+0xa0`, `+0xa4`, `+0xa8`, `+0xac` | `bit_limit_en`, `bit_limit`, `pad_en`, `pad_bits` | host `3cc`, `3d0` |
-| `+0xb0` | `qpd_bits` | accumulated bits of `mb_qp_delta` |
+| `+0xb0` | `qpd_bits` | accumulated `bs+44` deltas from before `write_mb_type` to after the `mb_qp_delta` se: the whole macroblock header (type, references, coded block pattern, qp delta); the last `bs+44` read follows the se port write without a poll, so the final code may not yet be counted |
 | `+0xb8`, `+0xbc` | `frame_num`, `frame_count` | frames since the last IDR, total frames |
 | `+0xc4`, `+0xc8` | `rc_a`, `rc_engine` | host `900` bit 9, bit 8 |
 | `+0xcc`, `+0xd0` | `run_val`, `run_prev` | record running value `rec4 >> 26` and its previous value |
@@ -692,7 +698,7 @@ own per-macroblock QP adaptation; (5) move small tables to host memory with the 
 reconstruction are **not** in the firmware: they happen in hardware, triggered by kicks (`bs+04`), and the firmware never sees the coefficients.
 
 **DMA channel.** The registers `000..030` (host offsets, same window as the host drives) are used by the core with mode 5 (local RAM -> system memory, 128-byte chunks, 2 words or 1 word at the tail).
-Mode 3 is written once in `main` followed by a start; mode 7 appears only in dead code. The channel completes in a polled `030 == 1`.
+Mode 3 is written once in `main` followed by a start; mode 7 appears only in dead code. The channel completes in a polled `030 == 1`. The write order, the sites and the chunk layouts are listed in [video-encoder.md](video-encoder.md#embedded-processor-local-ram-and-dma); every program-issued copy runs inside the `bs+5c` busy window while the mode-3 start is outstanding.
 
 **Bitstream engine facts** (derived from use, see the table below): the raw-bit port takes `(value, count)` and needs `+34` ready; `+0c` is a combined Exp-Golomb port; the writer inserts emulation-prevention
 bytes (`+78` counts them) only while `+30` bit 5 is set, and the firmware clears that bit for zero padding, for `00 00 03` CABAC units and for the end-of-NAL filler; every NAL is closed by 32 one-bits (plus 8, 16 or 24 more
@@ -709,14 +715,14 @@ Offsets are the host offsets.
 | Offset | Name | R/W | Used by | Role |
 |---|---|---|---|---|
 | `+000` | HOST_DMA_START | W | `stats_table_dma`, `dma_row_chunks`, `main` | DMA start, written 1 |
-| `+008` | HOST_DMA_MODE | W | `dma_row_chunks`, `main` | DMA mode: 3 in main (before the loop), 5 for every local-to-system copy |
-| `+00c` | HOST_DMA_WORDS | W | `stats_table_dma`, `dma_row_chunks` | DMA length in words (32 for 128-byte chunks, 2 or 1 words in the statistics copy, 16 for a vector row of 64 bytes) |
-| `+010` | HOST_OUT_ALIGN | W | `bs_flush_and_wait`, `main` | written 0 in the end-of-NAL flush (output alignment); also written in the dead tail of main |
+| `+008` | HOST_DMA_MODE | W | `dma_row_chunks`, `main` | DMA mode: 3 in main (before the loop, one start), 5 for every local-to-system copy (rewritten for each transfer) |
+| `+00c` | HOST_DMA_WORDS | W | `stats_table_dma`, `dma_row_chunks` | DMA length in words (32 for 128-byte chunks, 2 or 1 words in the statistics copy, a tail of `(len >> 2) % 32` words for a vector row, `len` = `0x280` or `(mb % 40 + 1) * 16`) |
+| `+010` | HOST_OUT_ALIGN | W | `bs_flush_and_wait`, `main` | written 0 in the end-of-NAL flush, after `bs+30 &= 0x1f` and before the polls of `03c`/`038` (output alignment); also written in the dead tail of main |
 | `+014` | HOST_DMA_SYS_ADDR | W | `stats_table_dma`, `dma_row_chunks` | DMA system address (host 348[30:0] statistics table, host c08[30:0] vector rows, plus chunk offsets) |
 | `+020` | HOST_DMA_LOCAL_ADDR | W | `stats_table_dma`, `dma_row_chunks` | DMA local address (0x600000 table RAM + n*0x80) |
-| `+030` | HOST_DMA_DONE | R | `stats_table_dma`, `dma_row_chunks` | DMA done, polled until 1 after every chunk |
-| `+038` | HOST_OUT_DMA_STATE | R | `bs_flush_and_wait` | output DMA state, polled until 0x80 or 1 in the flush |
-| `+03c` | HOST_OUT_FIFO_WORDS | R | `bs_flush_and_wait`, `main` | words pending in the 8-word output burst; flush pads with 32-bit words of ones until it reads 0 |
+| `+030` | HOST_DMA_DONE | R | `stats_table_dma`, `dma_row_chunks` | DMA done, polled after every chunk with an exact compare against 1 (not a bit test, fresh read, no delay); never read before a start; `008/00c/014/020` are never read |
+| `+038` | HOST_OUT_DMA_STATE | R | `bs_flush_and_wait` | output DMA state, polled until 0x80 or 1 in the flush (a second read only when the first is not 0x80) |
+| `+03c` | HOST_OUT_FIFO_WORDS | R | `bs_flush_and_wait`, `main` | words pending in the 8-word output burst; `03c` is read twice before the padding loop (zero test, then `8 - n`); flush pads with 32-bit words of ones until it reads 0 |
 | `+10c` | HOST_ABORT_REQ | R | `command_wait` | abort request: non-zero turns any wait into command 4 |
 | `+114` | HOST_DOORBELL | R | `command_wait` | doorbell: command_wait reads c0c only while it is non-zero |
 | `+118` | HOST_WIDTH | R | `load_stream_params_from_host` | picture width (header) |
@@ -790,11 +796,11 @@ Block description: [video-encoder.md](video-encoder.md#block-0x00520000--bitstre
 | `+014` | BS_PIC_SIZE | W | `frame_engine_setup` | padded width \| padded height << 16 |
 | `+020` | BS_MB_DONE | R | `mb_loop_cabac`, `mb_layer_cavlc` | macroblock done, polled |
 | `+030` | BS_WRITER_CTRL | RW | `bs_flush_and_wait`, `encode_headers`, `cabac_zero_words`, `frame_end` | writer control: 0x32 at header start, &0x1f before filler, \|0x20 after the flush (bit 5 = emulation prevention) |
-| `+034` | BS_PORT_READY | R | `bs_put_se`, `bs_put_ue`, `mb_layer_cavlc`, `bs_put_bits` | port ready, polled before each port write |
+| `+034` | BS_PORT_READY | R | `bs_put_se`, `bs_put_ue`, `mb_layer_cavlc`, `bs_put_bits` | port ready, polled before each port write: `!= 0` for the raw-bit port (`bs_put_bits`), `== 1` for the Golomb port (`bs_put_ue`, `bs_put_se`, `mb_layer_cavlc`) |
 | `+038` | BS_BIT_STROBE | W | `bs_put_bits` | raw-bit strobe (write 1) |
 | `+03c` | BS_BIT_COUNT | W | `bs_put_bits` | raw-bit count |
 | `+040` | BS_BIT_VALUE | W | `bs_put_bits` | raw-bit value |
-| `+044` | BS_BIT_TOTAL | RW | `bs_trailing_bits`, `write_pps`, `write_sps`, `encode_headers`, `frame_end`, `slice_close`, `mb_advance`, `slice_setup`, `mb_layer_cavlc` | bit counter (total bits since last clear, excluding escape bytes) |
+| `+044` | BS_BIT_TOTAL | RW | `bs_trailing_bits`, `write_pps`, `write_sps`, `encode_headers`, `frame_end`, `slice_close`, `mb_advance`, `slice_setup`, `mb_layer_cavlc` | bit counter (total bits since last clear, excluding escape bytes); written only with 0 (header NAL starts, frame end), read elsewhere |
 | `+048` | BS_MB_PARAM_A | W | `slice_setup`, `mb_layer_cavlc` | CABAC slice init word, or CAVLC macroblock parameter (skip<<7 \| cbp<<1 \| flag) |
 | `+04c` | BS_MB_PARAM_B | W | `slice_setup`, `mb_layer_cavlc` | CABAC slice init word, or CAVLC macroblock type |
 | `+050` | BS_KICK_DONE | R | `write_mb_type`, `mb_layer_cavlc` | motion / intra kick done |
@@ -805,7 +811,7 @@ Block description: [video-encoder.md](video-encoder.md#block-0x00520000--bitstre
 | `+068` | BS_ALIGN_STATE | R | `bs_flush_and_wait`, `cabac_zero_words` | alignment state 8 / 0x10 / 0x18 (bits pending) |
 | `+06c` | BS_ALIGN_BYTES | R | `cabac_zero_words` | byte count that sizes the CABAC zero-word tail |
 | `+070` | BS_REF_COUNT | W | `frame_engine_setup` | active reference count |
-| `+078` | BS_ESCAPE_COUNT | RW | `write_pps`, `write_sps`, `encode_headers`, `frame_end`, `slice_close`, `write_slice_header`, `slice_setup` | escape-byte (emulation prevention) count |
+| `+078` | BS_ESCAPE_COUNT | RW | `write_pps`, `write_sps`, `encode_headers`, `frame_end`, `slice_close`, `write_slice_header`, `slice_setup` | escape-byte (emulation prevention) count; written only with 0 (header, slice start, frame end), clamped to 1 after a slice start code |
 | `+080` | BS_DUMMY_READ_80 | R | `slice_close` | dummy read in slice_close (result discarded) |
 | `+0a8` | BS_STATUS_A8 | R | `main` | status, read only in the dead tail of main |
 | `+0b4` | BS_CLEAR_B4 | W | `encode_headers`, `frame_end` | written 0 at header start and frame end |
@@ -819,7 +825,7 @@ Block description: [video-encoder.md](video-encoder.md#block-0x00550000--picture
 | Offset | Name | R/W | Used by | Role |
 |---|---|---|---|---|
 | `+000` | PE_PICSIZE_HALF | W | `engine_init_registers` | host 600 >> 1 |
-| `+014` | PE_SLICE_LIMIT | W | `slice_limit_setup` | slice size limit (mode 0: host 324; mode 2: table; off: 0xfff) |
+| `+014` | PE_SLICE_LIMIT | W | `slice_limit_setup` | slice size limit (mode 0: host 324; mode 2: table; off or slice count `>= 0x1f`: 0xfff; mode 1 never writes it) |
 | `+018` | PE_HOST_120 | W | `engine_init_registers` | host 120 |
 | `+01c` | PE_CONST_4 | W | `engine_init_registers` | constant 4 |
 | `+020` | PE_CONST_1 | W | `engine_init_registers` | constant 1 |
@@ -831,7 +837,7 @@ Block description: [video-encoder.md](video-encoder.md#block-0x00550000--picture
 | `+044` | PE_REC_PLANE2 | W | `ref_planes_setup` | plane 0 + 2N |
 | `+048` | PE_REC_PLANE3 | W | `ref_planes_setup` | plane 0 + 2.5N |
 | `+04c` | PE_HOST_810 | W | `encode_headers`, `engine_init_registers` | host 810 |
-| `+080` | PE_DEBLOCK | W | `slice_setup` | deblocking: idc \| (alpha&0xf)<<8 \| (beta&0xf)<<3 |
+| `+080` | PE_DEBLOCK | W | `slice_setup` | deblocking: idc \| (alpha&0xf)<<8 \| (beta&0xf)<<3 (host `314` gives 5-bit fields; only the low 4 bits of each arrive) |
 | `+084` | PE_HOST_32C | W | `frame_engine_setup` | host 32c |
 | `+088` | PE_REF_CFG | W | `ref_planes_setup` | ref config: enable<<31 \| max refs<<8 \| ref count |
 | `+08c` | PE_REF_RW0 | W | `ref_planes_setup` | host 334 |
@@ -988,7 +994,7 @@ The first row is a finding about the *register image the firmware sees*: if the 
 | `314 = (5 << 7) \| (0x1b << 2) \| 2` | idc 2, `slice_alpha_c0_offset_div2 5`, `slice_beta_offset_div2 -5` (5-bit signed field) |
 | `3d4 = 1` (type 0), `= 3` (type 1), `= 5` (type 2) on every frame | non-IDR I slice (NAL 1, `slice_type 2`, `frame_num` counting), P slice, IDR again (`frame_num 0`) |
 | `3d0 = 0x80000000 \| 1600` | every frame padded with zero bytes to 200 bytes; `a0c = 200`, `a10 = 13` (IDR) or 9 (P) |
-| `348` enabled, two slices | 80 two-word DMAs of the header total to the table address, then the table in four 128-byte chunks and a final word; first record: header bits `0xa0`, slice 0 macroblock count `4`, bits used `0x48` |
+| `348` enabled, two slices | 40 two-word DMAs of the header total to the table address, then the table in four 128-byte chunks and a final word; first record: header bits `0xa0`, slice 0 macroblock count `4`, bits used `0x48` |
 | `c08` enabled | one vector row per picture: skip macroblocks give `0x00008000` (skip flag), the P macroblock `01230111` = `(type & 7) << 28 \| (v20 & 0x3ff) << 16 \| v30 & 0x1ff` |
 | CABAC (`310 = 1`), IDR | firmware output is the 9-byte NAL header only (the macroblock data is the engine's); engine writes `+08 = 0x80`, `+48 = 0x28`, `+4c = 0x800254`, `+00 = 0x10`, then four kicks `0x10000` (one per macroblock) and a final kick with `+54 = 1` |
 | CABAC P, `310[3:2] = 2` | slice header contains `cabac_init_idc 2` (P only) |
@@ -1019,6 +1025,7 @@ The iPod OS 1.0.1 uploads a `0x4624`-byte program. Structurally it is the same p
 
 - Which event clears host `114`: the read of `c0c` or the write of `50c`? The firmware never writes `114`.
 - What does the engine's mirror of host `904` contain: the value as written (with `0x10000`), or the masked field? It decides whether `rate_init_targets` is sane for the preset register images.
+- Do the core's mode-5 copies to system memory depend on the busy window (`bs+5c == 1`) or the programmed frame configuration, and does `030` stay 1 after a transfer until the next start? The program never reads `030` before a start.
 - Does the silicon accept profile 1 / 2 (Main / High) and CABAC (`310` bit 0) set by the host? The firmware path exists and produced valid headers; whether the engine's entropy coder, transform and prediction support them is unknown (the iPod OS always uses Baseline CAVLC).
 - What does each of the unmodelled engine status registers mean (`bs+20`, `+30` low bits, `+50`, `+dc`, `+f0`, `+60`) and which bits does `514` raise for each firmware write of `50c`?
 - What do DMA modes 3 and 7 do, and what does the `main` write of mode 3 plus start (without a programmed length) trigger?
@@ -1053,4 +1060,10 @@ The iPod OS 1.0.1 uploads a `0x4624`-byte program. Structurally it is the same p
 | Statistics DMA sends the header total 40 times, then 512 bytes plus one word | `firmware 0x0d60..0x0e60` | static; dynamic (G) |
 | Vector words `(type & 7) << 28 \| (v20 & 0x3ff) << 16 \| v30 & 0x1ff`; intra/skip `intra << 31 \| skip << 15` | `firmware 0x1b5c` | static; dynamic (G) |
 | 1.0.1 program: same structure, integer rate control with a table, no floating point, backup store absent | `firmware 0x26a0`, `0x2258` (1.0.1 addresses) | static |
-
+| Writer data ports use different ready predicates (`+34 != 0` raw bits, `== 1` Golomb); raw-bit order `+40`, `+3c`, `+38`; kick done polls `+50`/`+20`; `+00` sequence per header, frame and slice | `firmware 0x4374`, `0x3874`, `0x3894`, `0x3d04`, `0x4084`, `0x352c` | static |
+| Flush order; second argument 1 skips the `+dc` wait; `+f0` always polled; filler for alignment state 8 is `0x00ffffff` | `firmware 0x25c`, `0xcfc` | static |
+| Core DMA accesses: write order `020, 014, 00c, 008, 000`, `030 != 1` loop, no reads of `008/00c/014/020`, no `030` read before a start, `004/018..02c/034/040+` never touched | `firmware 0xd84..0xda8`, `0xdf4..0xe5c`, `0x1a7c`, `0x2018` | static |
+| Statistics copy is 40 warm-up copies, not 80 | `firmware 0xd84..0xdb4` (loop bound `0x28`) | static |
+| `P+0xb0` covers the whole macroblock header; alpha/beta repacked to 4 bits; `rate_state_load` reads record `+0x40` twice; `mb_qp_delta` condition | `firmware 0x3d04`, `0x352c`, `0x27d4` | static (disassembly over decompiler) |
+| Stream index 4..8 overruns the slot array, 8 the record array; `ctx+0x274` never read; `ctx_construct` unchecked allocations | `firmware 0x16c`, `0x18e4`, `0x188`, `0x228` | static |
+| Division faults: `rate_init_targets` (`904 == 0`, no macroblocks), `rate_thresholds_update` (QP 0..3) | `firmware 0x2104`, `0x26f8`, `0x2f8c` | static |

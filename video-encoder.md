@@ -50,11 +50,18 @@ Reset `mem:0x0812d014` writes, in order:
 
 Program load `mem:0x08120bf0`:
 
-1. IRQ reset.
-2. Start DMA with `110=1`; wait for its event.
-3. Clear `110`, then reset.
+1. IRQ reset (`500=0`, `518=1a2`, `508=1`; `mem:0x0812d1bc`).
+2. `110=1`; `00c=0x11d8`, `014=0x086bf000`, `020=0`, `000=1` (`mem:0x0812d044`, `0x08136390`); wait for the DMA
+   event (status bit 7). `014` is the image address as stored (bit 31 clear); no cache maintenance in this path.
+3. `110=0`, then reset.
 
 Source is RAM `086bf000`, length read from `086bdbe4` (`4760`).
+
+Configuration after the reset (`mem:0x081207e8`, observed order): `118, 11c`; `31c, 320, 324, 328, 344`;
+`34c + 4i` (i = 0..31); `300, 308`; `314`; `310`; `32c`; `904` (`| 0x10000`), `900, 90c, 908, 910`; `914`; `3cc`;
+`3d0`; `330`; `810`; `c00` (bit 24, bit 16, mode); `c04` (byte 3, 2, 1, 0). A restore pass
+(`mem:0x0812d100`) then rewrites `118, 11c, 300, 308, 314, 32c, 310, 31c, 320, 324, 810, 328, 344, 330, 904, 900,
+90c, 908, 910, 914, c00, c04` with the same values. Then `814` (scratch), `348`, `018, 01c, 024`, `108=1`, `134=1`.
 
 ## Configuration and buffer fields
 
@@ -104,8 +111,85 @@ Disable:
 
 Buffers stay owned until completion/idle, not just until submission returns.
 
-Clock entry `mem:0x08551db0` enables masks `80` at `0x3c500058` and `30000` at
-`0x3c500068`, active-low.
+Session order (`osos mem:0x08113ef0` open, `0x081d0588` job, `0x08113d1a` close; static, observed):
+
+- **Clock gate.** Clock `0x42` is bit 7 of `0x3c500058` and bits 16..17 of `0x3c500068`, active-low (enable clears
+  them). Entry `mem:0x08551db0` = `{0x42, 0, 0, 0x80, 0x30000, 0}` in the table at `0x08551780` (0x18-byte entries);
+  `mem:0x220002f4` returns `0x13` for a non-zero selector or an id above `0x49`. The bit changes are two
+  read-modify-writes with CPSR I and F set; `3c500048/4c/6c` are not touched. Only the open, job and close functions
+  use id `0x42` (5 call sites); no other clock-controller write and no power-manager call is made for the encoder.
+  The clock is on from the start of open until right after `108=1, 134=1` (set-up `mem:0x08113fa8`, call `0x08113fac`),
+  on again for each job (`0x081d05ae` to `0x081d0abe`; the off runs on every exit path, early exits included) and for
+  close (`0x08113eb0` to `0x08113ed4`). If the encoder object cannot be allocated, open returns with the clock still on
+  (`0x08113f1c`). The core is clock-gated between open and the first job and between jobs; whether it keeps its state
+  or keeps running while gated is not established.
+- **IRQ line.** The handler is installed and VIC1 bit 27 (vector 59) unmasked inside the encoder constructor
+  (`mem:0x0812d21c` via `0x0818e6ca`, `0x0826857c`, `0x081934b8`): `0x38e01014 = 0x08000000` (mask),
+  `vic_table[59] = 0x08133019`, `0x38e01010 = 0x08000000` (enable), before any encoder register is written; a status
+  left pending therefore raises the interrupt before the first `508=1` (inferred). The dispatcher
+  (`mem:0x22006638`) reads `0x38e00000`, `0x38e01000` and `0x38e01f00`, calls the handler, then writes
+  `0x38e0200c = 0x08000000` and `0x38e01f00 = 0x01010101`.
+- **ISR and events.** The ISR reads `514`, writes `508=1` before any decision and signals one event; `500` and `518`
+  are not touched, and a second status bit arriving together with the first is lost. The events are counting
+  semaphores with initial count 0 (constructor `mem:0x081208fc` through `0x08218814`): wait (`0x082187e4` ->
+  `0x2200626e` -> `0x220030d8`) decrements and blocks while the count is negative, signal (`0x0820f974` ->
+  `0x22003074` -> `0x220030f0`) increments. No wait has a timeout, no event is ever cleared (a signal with no waiter
+  stays queued and satisfies a later wait), and the driver has no register polling loop and no sleep: a missing
+  completion blocks forever.
+- **Open.** Clock on; allocate the `0x114`-byte register cache (`mem:0x08120bb4`; vector `0x3b` IRQ object) and
+  unmask the IRQ as above; upload and configuration in the orders listed under program load (`mem:0x08120bf0`,
+  `0x081207e8`); `814` = scratch `& 0x7fffffff`; `348`; `018, 01c, 024`; `108=1`, `134=1`; clock off.
+- **Job** (`mem:0x081d0588`): clock on when the encoder and the rate-control object exist. With rate control active
+  `90c = (max<<8)|min` (`3301` when invalid), then `900` read-modify-write of the low 6 bits (QP). First job of a
+  stream only: `c0c = stream<<8|1`, `114=1`, wait for the command event, output read (command 1 inside the first job,
+  after `90c`/`900`). Then the references (`33c, 340` = read slot `frame & 1`; `334, 338` = write slot
+  `(frame & 1) ^ 1`), `3d4 = (type or 0)<<1 | mode` (the type only when the configuration's mode is non-zero), and
+  the planes `800, 804` (`& 0x7fffffff`) before `344`. A repeated input instead writes `3d4 = 2|mode` and
+  `344 = repeat`, with no planes. Frame command `c0c = stream<<8|2`, `114=1`, wait: issued when `repeat == 0` or the
+  stream is 0. Afterwards: `918` read (low 6 bits, only if the configuration asks for the last QP), the output read,
+  optionally `a08`, and with rate control `a00`, `a04` (only when `repeat == 0` or stream 0). Rate mode 2 sends the
+  stream 1 command with each incoming frame and the stream 0 command `delay - 1` frames later; an I frame after an I
+  frame is given type 0.
+- **Output cursor** (`mem:0x0812d0b0`, after each command): read `018`, `01c` (value discarded), `034`, `024`; write
+  `024 = 034` only if they differ; then `a0c`. The frame is at ring start + (`024` - `018`). When offset + bytes exceed
+  the ring size (`01c - 018`), the first `offset + bytes - ring` bytes of the ring are copied to `output + ring`:
+  headers by CPU copy (`mem:0x220001ec`), frame data by DMA copy (`0x081916cc`, bit 31 of both addresses masked, at
+  most `0xff00` bytes per block) only if the overshoot is at most `0x38400`. The slack after `01c` exists because the
+  engine can write past it (inferred from this copy).
+- **Results.** The OS reads the metadata buffer big-endian: word 0 = header bits (`>> 3` = header bytes); the record
+  of slice 0 at `+4..+0x10` = macroblock count, cost, bits (`>> 3` = bytes), auxiliary word, the next slices at
+  16-byte stride. `a00` low half = intra, high half = inter macroblocks; `a04` = status.
+- **Buffers.** One arena `"MeCCA_VdRecBufferMgr"`, `0x2f8000` bytes, is created at the first wake-up of the encode
+  thread (`mem:0x08135df8`, `0x0827ee88`), before any recording, and freed at capture end without cache
+  maintenance. Seven blocks, each `alloc(arena, size, align index 3, uncached 1)`:
+
+| # | Block | Size | Register | Value |
+|---|---|---|---|---|
+| 1-4 | references [stream][slot] | `0x7e900` (720x480 4:2:0) | `334/338` write, `33c/340` read | `addr & 0x7fffffff`; chroma = `+padded_w*padded_h` |
+| 5 | scratch | `0x5a00` | `814` | `addr & 0x7fffffff` |
+| 6 | metadata | `0x210` (`0x10` header + 32 x `0x10`) | `348` | `(addr & 0x7fffffff) \| 0x80000000` |
+| 7 | output | `0x96800` = ring `0x5e400` + slack `0x38400` | `018` = addr, `01c` = addr + `0x5e400`, `024` = addr | masked |
+
+- **Alignment and alias.** Index 3 is `{extra 0x3ff, mask 0xfffffc00}` (table `mem:0x08552610`): each block starts on a
+  1 KiB boundary with the allocator's size word in the 4 bytes before it; sizes are not rounded. `uncached = 1`
+  (`mem:0x0823ec30`): D-cache clean and invalidate over `[block - 4, block + size)` (`0x0818e732`: set/way per line
+  below 128 bytes, otherwise the whole D-cache plus a write-buffer drain), then the returned pointer has bit 31 set
+  (uncached alias of the same SDRAM); the memory is not cleared. The OS reads metadata, ring and slack through the
+  alias; every address handed to the encoder is `& 0x7fffffff`, except `348`, where bit 31 is the enable flag
+  (`mem:0x08120b94`; written once per recording after `814`, before the ring registers, never cleared or read).
+  No cache maintenance exists in the open, job or close paths; the input planes (`800/804`, from the frame object) and
+  the upload source `0x086bf000` (unmasked) are not maintained either. Coherence rests on the alias (inferred).
+- **Close** (`mem:0x08113d1a`, after the queued jobs drained): clock on; `10c=1`, wait for the idle event, `10c=0`,
+  `134=0`, `130=1`, `130=0`, `108=0`; `500=0`, `518=1a2`, `508=1` (`mem:0x0812d1d4`); the IRQ line is masked last
+  (`0x081934a4`: mask, `vic_table[59] = 0`, object freed); clock off. No write to `048` or `600` and no `514` read.
+- **Never accessed.** Writes: `008`, `c08` (the vector-row dump enable keeps its power-up value, so vector rows stay
+  off), `010`, `03c`, `030`, `50c`, `510`, `504`, `600` other than 0. The only registers read are `018, 01c, 024,
+  034` (output cursor), `514` (ISR), `900`, `918`, `a00`, `a04`, `a08`, `a0c`. Commands 4 and 5 are never sent (the
+  command writer `mem:0x0813632c` has callers with 1 and 2 only; stop is `10c=1`). Bounded negative search: every
+  word of the image with high half `3e40`/`be40`/`7e40` (55 literal-pool loads, all inside `0x08120b78..0x08120bea`,
+  `0x0812cd44..0x0812d21c`, `0x08133018`, `0x0813632c..0x081363a2`), the three `movs #0xf9; lsls #22` sites
+  (`0x08120be0`, `0x0812d0ba`, `0x08136390`), and register-offset tracking over those ranges; no exact `0x3e400000`
+  literal and no uncached-style `0xbe4xxxxx` literal exists.
 
 ## Unknowns
 
@@ -114,8 +198,11 @@ the engine. Not known: physical throughput, fault-bit meanings, the engine
 fields listed as unknown in the firmware sections, the embedded processor's
 core type and clock, the width of matrix words 5..31, the meaning of DMA
 modes 3 and 7, what each mode does with a valid system address, whether the
-embedded processor can start a system-to-local copy, and whether its
-load/store unit can reach any address outside the encoder.
+embedded processor can start a system-to-local copy, whether its
+load/store unit can reach any address outside the encoder, whether the core's copies to system memory depend on
+the busy window or the frame configuration (every copy of the original program runs inside `52005c = 1` with
+the mode-3 start outstanding), whether `030` stays 1 after a transfer until the next start re-arms it, and
+whether the core keeps its state while the clock gate is off.
 
 ## Embedded firmware
 
@@ -176,9 +263,17 @@ firmware are reads of the host-written words at the same offset):
 | `c08` | bit 31 and bits `[30:0]` copied into the context at each frame |
 | `c0c` | command word: bits `[15:8]` stream index, bits `[7:0]` command |
 
+Host registers read per command (observed): header `0x924`: `118, 11c, 300, 308, 310, 810, 3d4, 80c, 330, 900`; header
+rate set-up: `904, 908, 910` (targets), `910` and `90c` (twice; defaults). Frame, `0x3b88`: `3d4, 330, 324, 31c, 320,
+328, 344, 3cc, 3d0, 314, 348, c08` (twice), `900`; the clamp of `324 - 0x780` tests the sign of the subtraction, and the
+dump enable is `c08 & 0x80000000` (not shifted). Frame, `0x4084`: `32c, 900, 914`, `90c` only when firmware rate
+control A is off, `908, 910, 904, 814, 800, 804`; in bypass mode also `90c, 91c, 920, 924, 928, 92c, 930, 934, 938`
+(twice for frame type 0), `93c, 940, 944`; the forced engine rate flag writes `900` and `914` back (`PIC+140 | 0x100`,
+`PIC+154 = 0xf`). `0x2320` reads `90c`.
+
 Command loop (firmware `0x1f98`, wait routine `0x1f08`): the processor spins
 until `114` is non-zero, then takes `c0c`; if `10c` is non-zero the command
-becomes 4 regardless. The loop accepts stream indices 0..8, but only 0..3 stay inside the eight-slot stream array, because the pre-frame backup goes to slot `stream+4`.
+becomes 4 regardless. The loop accepts stream indices 0..8, but only 0..3 stay inside the eight-slot stream array, because the pre-frame backup goes to slot `stream+4`: the slot array is `0x2c0` bytes (eight slots of `0x58`), streams 4..8 write the backup beyond it, and stream 8 also overruns the `0x2a0`-byte result-record array. Each pass reads `c0c` twice (stream from bits 15:8, then command from bits 7:0) and exits when `stream <= 8 && command <= 5` (signed test).
 
 | Command | Handler | What it does |
 |---|---|---|
@@ -230,10 +325,10 @@ embedded processor drive it through the same offsets:
 |---|---|---|---|
 | `000` | start, write 1 | 1 | 1 |
 | `008` | mode | never written | `5` for every local-to-system copy; `3` before the command loop (`firmware 0x202c`); mode 3 not decoded (a `7` after the loop is unreachable) |
-| `00c` | length in 32-bit words | `0x11d8` (`0x4760 >> 2`) | `0x20` (128 bytes) per chunk, `2` or `1` in the statistics copy |
+| `00c` | length in 32-bit words | `0x11d8` (`0x4760 >> 2`) | `0x20` (128 bytes) per chunk, `2` or `1` in the statistics copy, the tail of a vector row |
 | `014` | system-memory address | SDRAM address of the image | host `348[30:0]` (statistics table) and host `c08[30:0]` (vector rows) plus offsets |
 | `020` | encoder-local address | `0` | `0x600000 + n*0x80` (table RAM) |
-| `030` | done, reads 1 | not read; the host waits for `514` bit 7 (IRQ59) | polled until it reads 1 after every chunk |
+| `030` | done, reads 1 | not read; the host waits for `514` bit 7 (IRQ59) | polled until it reads exactly 1 after every chunk |
 
 Host upload sequence (`osos mem:0x08120bf0`, the DMA start `osos mem:0x08136390` is
 its only use): IRQ reset (`500=0`, `518=1a2`, `508=1`); `110=1`; `00c`, `014`,
@@ -241,6 +336,41 @@ its only use): IRQ reset (`500=0`, `518=1a2`, `508=1`); `110=1`; `00c`, `014`,
 never writes `008`. Observed in both images; that `008` selects the direction is
 inferred from the firmware writing `5` only for copies whose data flows from
 table RAM to a host-supplied address.
+
+**Firmware-side sequence** (observed; complete inventory of the core's accesses to the window below `0x100`:
+register-tracking scan plus manual reading of the whole image). The core writes `000`, `008`, `00c`, `010`, `014`,
+`020` and reads `030`, `038`, `03c`; it never accesses `004`, `018..02c` other than `020`, `034`, or anything from
+`040` up. `008`, `00c`, `014` and `020` are never read; `030` is never written and never read before a start. Every
+mode-5 copy writes `020` (local), `014` (system; the load of the `P` field that supplies it sits between the two
+stores), `00c` (words), `008 = 5` (rewritten for every transfer), `000 = 1`, in that order, then loops
+`while (030 != 1)`: a fresh read on each pass compared for equality with 1 (not a bit test), no delay.
+
+| Site | Transfers | `020` | `014` | `00c` |
+|---|---|---|---|---|
+| statistics copy `firmware 0xd60`, warm-up (`0xd84..0xdb4`) | 40 identical (loop to `0x28`), after the header total was stored at `0x600000` and before the table is padded | `0x600000` | `348[30:0]`, no offset | 2 |
+| same, table (`0xdf4..0xe2c`) | 4 (chunk i = 0..3) | `0x600000 + i*0x80` | `348[30:0] + i*0x80` | `0x20` |
+| same, last word (`0xe30..0xe5c`) | 1 | `0x600200` | `348[30:0] + 0x200` | 1 |
+| vector row `firmware 0x1a7c` (called from `0x1ca4`) | `len >> 7` chunks, then one tail of `(len >> 2) % 32` words if non-zero | `0x6002a0 + i*0x80` | `c08[30:0] + row*0x280 + i*0x80` (`row` = `S+0xdc`, incremented after the row) | `0x20`, tail |
+| `main` `firmware 0x2018..0x2034` | one start, mode 3 | not written | not written | not written; `030` not polled |
+| `main` dead tail `0x203c..0x2074` | mode 7 after `010 = ((+a8 & 0x1f) + 7) >> 3` and `03c < 8` (unsigned) | | | never executed |
+
+- The vector-row length is `0x280` (a full row of 40 macroblocks) or `(mb % 40 + 1) * 16` at the last macroblock, and
+  the copy happens only when host `c08` bit 31 is set (`P+0xe0`).
+- The system address is the 31-bit field of `348`/`c08` (`& 0x7fffffff`; bit 31 is the enable) plus the offsets,
+  exactly as the host wrote it; the firmware enforces no alignment of the base.
+- Before the table copy, record indices from the slice count (`ctx+0x2a4`) up to 31 are padded: five zero words
+  (`+4..+0x14`) per index (signed compare against `0x20`, so nothing is padded for 32 or more slices); the fifth word
+  overlaps the next record's first word and for index 31 reaches `0x600204`. The table words were stored by CPU
+  stores long before the copy; only the header total (`TBL(0)`) is stored directly before the first warm-up copy.
+- The mode-3 start is the only one of its kind: issued once, with `00c/014/020` as the host upload left them, never
+  polled; the later `008` writes replace the mode. In the device tests below a mode-3 start left `030` at 0
+  (never completed), so all mode-5 copies of the original program are issued while that start is outstanding
+  (inferred).
+- Engine state at each copy (observed): both copy kinds run with `52005c == 1` (see the busy window below) and the
+  frame configuration programmed. The vector-row copy is issued mid-slice, after the record decode and before the
+  macroblock syntax or kick; the writer holds the slice header and earlier macroblock bits and its output DMA may
+  still be draining (nothing waits for `038/03c` there). The statistics copy follows the end-of-frame flush, so the
+  writer FIFO is empty and its output DMA idle, and then `PIC+160/168/16c`, `a00` and `TBL(0)` have been written.
 
 **Device tests with a test program in the core** (the program was uploaded by
 the host sequence above). The test program took its arguments from the matrix
@@ -359,7 +489,7 @@ macroblock type, se for QP deltas).
 
 | Offset | Access | Value / meaning | Routine | Stage |
 |---|---|---|---|---|
-| `+00` | W | `4` raw-bit mode; `0x10` CABAC slice init (after `+48`, `+4c`); `1` frame start | `0x68c`, `0x5c0`, `0x352c`, `0x4084` | header, slice, frame set-up |
+| `+00` | W | `4` raw-bit mode; `2` then `4` at slice set-up; `0x10` CABAC slice init (after `+48`, `+4c`); `1` frame start | `0x68c`, `0x5c0`, `0x352c`, `0x4084` | header, slice, frame set-up |
 | `+04` | W | kick: `4` macroblock residual/syntax (waits `+20`); `0x800` motion data of a P macroblock (waits `+50`); `0x80` intra prediction modes (waits `+50`); `0x10000` CABAC macroblock (waits `+20`) and end of slice | `0x3d04`, `0x38b0`, `0x1d88` | per macroblock |
 | `+08` | W | entropy mode: `4` when `P+0x24 = 0` (CAVLC), `0x80` when 1 (CABAC) | `0x4084` | frame set-up |
 | `+0c` | W | Golomb data port: `v<<16` ue, `v<<16\|1` se, `v<<16\|2` / `v<<16\|3` coded-block-pattern code (3 for inter, 2 for intra macroblocks; *inferred* me(v) tables) | `0x3894`, `0x3874`, `0x3d04`, `0x1340` | header, slice, macroblock |
@@ -374,10 +504,11 @@ macroblock type, se for QP deltas).
 | `+50` | R | motion/intra data kick done | `0x3d04`, `0x38b0` | per macroblock |
 | `+54` | W | `0`, then `1` before the final `0x10000` kick; `0` after (end-of-slice request) | `0x1d88` | end of slice |
 | `+58` | W | `P+0x34` (macroblock count of the picture) | `0x4084` | frame set-up |
-| `+5c` | W | `1` at frame set-up, `0` at frame end (busy) | `0x1834`, `0xd10` | frame |
+| `+5c` | W | `2` then `1` at frame set-up, `0` at frame end (busy window; every mode-5 copy of the program runs inside it) | `0x1834`, `0xd10` | frame |
+| `+60` | R/W | read and written back at frame end, after `+5c=0` (acknowledge) | `0xd10` | frame |
 | `+68`, `+6c` | R | bit alignment state `8 / 0x10 / 0x18`; byte count that decides how many `00 00 03` units the tail needs | `0x25c`, `0xe8c` | end of frame |
 | `+70` | W | `P+0x5c` (active reference count) | `0x4084` | frame set-up |
-| `+78` | R/W | **escape-byte count**: bit total is `+44 + +78*8` everywhere (*inferred* emulation-prevention bytes); clamped to 1 in `0x1340`; zeroed at each header and at frame end | `0x68c`, `0x1104`, `0xf3c` | all |
+| `+78` | R/W | **escape-byte count**: bit total is `+44 + +78*8` everywhere (*inferred* emulation-prevention bytes); clamped to 1 in `0x1340`; written only with 0 (each header, each slice start, frame end) | `0x68c`, `0x1104`, `0xf3c` | all |
 | `+b4` | W | `0` | `0xbec`, `0xf3c` | header, end of frame |
 | `+c8` | W/R | handshake: write `1`, poll until `0`. Per macroblock fetch in `0x4060`; also at the last macroblock in `0x1104` | `0x4060`, `0x1104` | per macroblock, end of frame |
 | `+a8`, `+dc`, `+f0` | R | start-up and flush-done status (`+a8&0x1f` feeds host-side offset `010`; `+dc` and `+f0` polled in the final flush) | `0x2018`, `0x25c` | start-up, end of frame |
@@ -385,6 +516,35 @@ macroblock type, se for QP deltas).
 Also accessed: `+60` read and written back unchanged at frame end, `+80` read once and discarded.
 
 Unknown: bit meanings of `+20`, `+50`, `+30` low five bits, `+60`, `+dc`, `+f0`.
+
+**Port protocol** (observed; `firmware 0x25c`, `0x352c`, `0x3874`, `0x3894`, `0x3d04`, `0x4060`, `0x4084`, `0x4374`):
+
+- *Ready predicates.* The data ports test `+34` differently: raw bits wait for `!= 0`, the Golomb port (ue, se,
+  coded block pattern) waits for `== 1` exactly. The firmware polls before every port write and never after one.
+- *Raw-bit write order.* `+40 = value`, `+3c = count`, `+38 = 1` last (strobe); no completion poll, the next port
+  write polls `+34`. Needs `+00 = 4`.
+- *Golomb port.* `+0c = value<<16 | mode`; for modes 2 and 3 the value is the raw coded block pattern and the engine
+  maps it to the code (inferred).
+- *Kicks.* `+04 = 0x80` (intra prediction modes) and `0x800` (motion data) are followed by a poll of `+50 != 0`;
+  `+04 = 4` (residual, or a skipped macroblock) and `0x10000` (CABAC) by a poll of `+20 != 0`. The firmware never
+  writes `+20` or `+50`, so the engine clears them when a kick is written (inferred).
+- *Macroblock parameter words (CAVLC).* `+4c = mb_type` before the type code; `+48 = skip<<7 | cbp<<1 | flag`
+  (flag: type in the coded range) before kick 4; a skipped macroblock writes `+48 = 0x80 | cbp<<1`.
+- *Fetch handshake.* `+c8 = 1`, poll until `0`, then `+10 = macroblock address`. Records at `0x200000` are valid only
+  after it and are read with plain loads (words 0 and 4 once each).
+- *`+00` sequence.* Header command: `+30 = 0x32`, `+44 = 0`, `+78 = 0`, `+b4 = 0` once, then `+00 = 4`, `+44 = 0`,
+  `+78 = 0` at the start of each SPS and PPS. Frame set-up: `+14`, `+58`, `+70`, reference planes, `+10 &= ~7`,
+  `+00 = 1`, then `+08` (`4` CAVLC, `0x80` CABAC). Slice set-up: `+00 = 2`, `+00 = 4`, read `+44` (slice start bits),
+  `+78 = 0`, slice header; CABAC only: `+48`, `+4c`, `+00 = 0x10`.
+- *Counters.* `+44` is only read in the slice and macroblock paths (written 0 at header NAL starts and frame end);
+  `+78` is written only with 0 and clamped to 1 after a slice start code; `+30` is not touched in those paths.
+- *Busy window.* `+5c = 2`, `+5c = 1` in frame set-up (the first write is visible only in the disassembly); `+5c = 0` in
+  frame finish, after the statistics copy; then `+60` is read and written back unchanged, host `514` bit 1 is polled
+  until clear and `50c = 1` is written. Every copy to system memory issued by the program lies inside this window.
+- *Flush (`0x25c`).* 32 one-bits plus 0..24 more chosen by `+68` (state 8: 24 bits, `0x00ffffff`); `+30 &= 0x1f`;
+  host `010 = 0`; wait `03c < 8`; wait `038` = `0x80` (a second read only if the first is not `0x80`) or 1; if `03c`
+  (read again) is non-zero, pad `8 - n` words of ones, wait `03c == 0` and `038 == 0x80`; `+30 |= 0x20`; poll `+f0`
+  until 0 and, unless the second argument is 1 (header flush), `+dc` until 1.
 
 ### Block `0x00550000` : picture / macroblock pipeline parameters (inferred)
 
@@ -395,7 +555,7 @@ with a fixed offset of `0x7c0` for the host copy done in `0x4084` (`900->140`, `
 | Offset | Access | Value / meaning | Routine | Stage |
 |---|---|---|---|---|
 | `+00` | W | host `600>>1` (also kept in `ctx+0x294`; non-zero selects the tiled reference layout) | `0x1f78` | start-up |
-| `+14` | W | slice limit: `P+0x80` (mode 0), table entry `host[34c+4*slice]` (mode 2), else `0xfff` | `0x12a4` | per macroblock (from `0x352c`) |
+| `+14` | W | slice limit: `P+0x80` (mode 0), table entry `host[34c+4*slice]` (mode 2), else `0xfff`; modes 0 and 2 write `0xfff` when the slice count is `>= 0x1f` (signed) or the limit is 0; mode 1 writes only `P+0x7c = 0x7fffffff` (slice count `>= 0x1f`) and never this register; other modes write nothing | `0x12a4` | per macroblock (from `0x352c`) |
 | `+18`, `+24` | W | host `120`, `124` | `0x1f78` | start-up |
 | `+1c`, `+20` | W | constants `4`, `1` | `0x1f78` | start-up |
 | `+30`, `+34` | W | host `800`, `804` (input planes) | `0x4084` | frame set-up |
@@ -468,6 +628,9 @@ them. `+a0` is a stop/degrade request toward it.
 | `0x600004 + 0x10*slice` | per slice: macroblock count `ctx+0x2a8`; `200004` word plus delta of its bits 31:26; bits used `ctx+0x2e4 + ctx+0x2d4`; `200008` word. Index is the slice counter `ctx+0x2a4`, at most 32 entries | `0x1104` |
 | `0x6002a0 + 0x10*(mb % 40)` | four vector words per macroblock (see below) | `0x1b5c` |
 
+For CABAC the slice close also stores a statistics word at `0x5ffffc + 16*slice_count` (literal `firmware 0x1100`); with
+slice count 0 that is one word below table RAM (observed).
+
 Vector words (`0x1b5c`): word 0 `(type&7)<<28 \| (v20&0x3ff)<<16 \| v30&0x1ff`; words 1..3 the same pair for partitions 1..3.
 Intra and skipped macroblocks get `intra<<31 \| skip<<15` instead (P pictures only); other types get 0.
 `0x1c4c` ships a full row (`0x280` bytes = 40 macroblocks x 16) through the `0x500000` DMA registers to
@@ -512,12 +675,16 @@ Each NAL starts with a 32-bit start code `00 00 00 01` written as `(1, 32 bits)`
 | macroblock count `P+0x34` | `mbw * mbh` |
 | crop `P+0x10` / `P+0x14` | `(mbw*16 - W) >> 1` / `(mbh*16 - H) >> 1` (2-pixel units); flag `P+0x8c = 1` when either dimension is not a multiple of 16 |
 
+The crop flag is cleared by the stream defaults and only ever set here; `P+0x10/+0x14` and the padded sizes are not
+cleared by the defaults and keep the previous header's values when the new size is aligned (the cleared flag keeps
+them unused).
+
 ### `0x68c` : sequence parameter set, NAL byte `0x67`
 
 | Syntax element | Emitted as | Source |
 |---|---|---|
 | `profile_idc` and constraint byte | 16 bits: `0x4200` Baseline, `0x4d00` Main, `0x6400` High (constraint flags all 0) | `P+0x1c` = host `300[1:0]` (0, 1, 2) |
-| `level_idc` | 8 bits | `P+0x20` = host `300>>2` (raw level value) |
+| `level_idc` | 8 bits | `P+0x20` = host `300>>2` (raw level value, no mask: bits above 8 stay in `P+0x20`, only 8 bits are written) |
 | `seq_parameter_set_id` | `1` bit (ue 0) | constant |
 | High-profile extras | 7 bits `0x2c`: chroma 4:2:0, 8-bit depth, no bypass, no scaling matrix | profile 2 only |
 | `log2_max_frame_num_minus4` + `pic_order_cnt_type` | 10 bits `0x6b`: ue(12) then ue(2); frame number is 16 bits; POC type 2 | constant |
@@ -534,7 +701,7 @@ Each NAL starts with a 32-bit start code `00 00 00 01` written as `(1, 32 bits)`
 | Syntax element | Emitted as | Source |
 |---|---|---|
 | ids, entropy mode, field flags, slice groups | 5 bits `0x19` (CAVLC) or `0x1d` (CABAC): pps id 0, sps id 0, entropy flag, bottom-field flag 0, ue(0) | `P+0x24` = host `310` bit 0 |
-| `num_ref_idx_l0_default_active_minus1` | ue(`P+0x54`) | host `330[11:8]` |
+| `num_ref_idx_l0_default_active_minus1` | ue(`P+0x54`) | host `330[11:8]` (`P+0x50` and `P+0x54` both get this field at header time; `P+0x5c` keeps its default 0) |
 | l1 default, weighted prediction | 4 bits `1000` | constant |
 | `pic_init_qp_minus26` | se(`P+0x30 - 26`); also copies `P+0x30` to `P+0x2c` | host `900[5:0]` |
 | QS, chroma offset, deblocking control, constrained intra, redundant count | 5 bits `11100` | constant |
@@ -575,6 +742,10 @@ NAL byte and escape bytes. Host `a0c` after the header is `(ctx+0x2d8 + ctx+0x2d
 | `disable_deblocking_filter_idc` | ue(`P+0x64`) = host `314[1:0]` |
 | alpha / beta offsets | se(`P+0x6c`), se(`P+0x70`) when idc is not 1; 5-bit signed from host `314[11:7]` and `314[6:2]` |
 
+The engine register `0x550080` is repacked from the same fields (`0x352c`, disassembly) as
+`idc | (alpha<<8) & 0xf80 | (beta<<3) & 0x7c`: only the low 4 bits of each offset arrive, alpha at bits 11:8 and beta at
+bits 6:3, so the sign bit of the 5-bit field does not reach the engine (inferred consequence).
+
 ## Macroblock loop (`firmware 0x18c4`, entered from `0x1ee4`)
 
 Per frame: `0x16c` selects the stream slot, `0x1834` frame set-up, `0x368` backs up P to slot `stream+4`, then the loop
@@ -585,7 +756,7 @@ One iteration of the outer loop is one **slice**, not one macroblock:
 
 | Step | Routine | Action |
 |---|---|---|
-| 1 | `0x1550` | refine picture type for this slice. With slice mode off (`P+0x74 = 0`) it only sets `ctx+0x2a0 = (type == 1)`. With slice mode on: bit `slice` of host `328` forces type 0 unless IDR; bit of host `344` forces a refresh (`ctx+0x2b8 = 1`) of a P slice when `ctx+0x2c0 = 0`; the bit-limit flag `ctx+0x2c4` from host `3cc` takes part. |
+| 1 | `0x1550` | refine picture type for this slice. With slice mode off (`P+0x74 = 0`) it only sets `ctx+0x2a0 = (type == 1)`. With slice mode on: bit `slice` of host `328` forces type 0 unless IDR; bit of host `344` forces a refresh (`ctx+0x2b8 = 1`) of a P slice when `ctx+0x2c0 = 0`; the bit-limit flag `ctx+0x2c4` from host `3cc` takes part; the per-slice bit tests are register shifts, so a slice number of 32 or more tests as 0. |
 | 2 | `0x352c` | slice set-up: clears `ctx+0x2a8/+0x2bc/+0x2c8`, writes slice header (`0x1340`), `0x550080`, CABAC init words (`0x520048/4c`), `0x560004/0c/14`, calls `0x12a4` |
 | 3 | handler through the pointer | codes every macroblock of the slice until `ctx+0x2c8` is set |
 | 4 | `0x1104` | slice close: zero-aligns (CAVLC: stop bit and zeros through `0x528`; CABAC: zeros only), updates bit totals `ctx+0x2d0/+0x2e0/+0x2e4`, sets the over-limit flag `ctx+0x2c4 = (P+0xa4 < bits)`, stores the statistics record, increments the slice counter `ctx+0x2a4`. At the last macroblock (`ctx+0x2cc`) it runs the `+c8` handshake first. |
@@ -607,6 +778,17 @@ advance `ctx+0x2ac` (index), `ctx+0x2a8` (count), column `ctx+0x2b0` (row `ctx+0
 (skip run as ue when the picture is P, macroblock type as ue (I16x16 type = `1 + pred_mode + 4*chroma_cbp + 12 if luma_cbp`),
 sub-macroblock types `1111`, reference indices: one inverted bit when `P+0x54 = 1`, else ue), motion kick `0x800`, coded-block-pattern
 code through `+0c` modes 2/3, `mb_qp_delta` se, residual kick `4`. At slice end a pending skip run is flushed with ue (`firmware 0x1d80`).
+
+Disassembly corrections to the decompiler listing (observed): the `mb_qp_delta` se is written when the coded block
+pattern is non-zero, or the slice type is 0 or 2 with a non-zero macroblock type, or a P macroblock has
+`mb_type - 6 < 0x18` (unsigned); it is not written for every type 0. The macroblock-type writer `0x38b0` reads the
+type class on the inter path, replaces the type by `S+0x0c` for intra macroblocks of P pictures, maps type 3 to 4
+when the reference count is 0, and ends in a tail branch to the ue writer after kick `0x80`, the chroma mode last.
+`P+0xb0` accumulates `+44` deltas from before the macroblock-type code to after the `mb_qp_delta` se, so it covers the
+whole macroblock header (type, references, coded block pattern, qp delta), not only the delta; the last `+44` read
+follows the se port write without a poll, so the final code may not yet be counted. After the end marker
+(`MBREC(0) == 0xffffffff` with slice mode on, read once) both loops go straight to their epilogue. `0x19d4` compares
+`P+0x7c` unsigned with `+44 >> 3` and the macroblock address signed with `count - 5`.
 
 Per-macroblock register **reads** from `0x550000` and `0x560000`: none, except the `0x56000c` read-modify-write in
 `0x352c`. All other reads of those blocks are per frame (`0x550140`, `0x550158`, `0x550174`). All per-macroblock
@@ -667,6 +849,14 @@ unmodified `0x550140` start value into the window is unknown.
 | thresholds (`0x26f8`) | `avg = 0x550174 / P+0x34`, floor `0x10`, cap `0x3ff` into `ctx+0x2c`, `ctx+0x48`; `ctx+0x4c = ctx+0x54 = 0x3000 / (2 * Qstep(QP))` clamped to 0..`0x1ff` (`0x19` when `avg = 0x10`); `Qstep` from the double table at `firmware 0x45d8` (0.625, 0.6875, 0.8125, 0.875, 1.0, 1.125, times 2^(QP/6)); written to `0x550168`, `0x55016c` |
 | completion | `0xd10` clears `0x52005c`, waits for host `514` bit 1 to clear, writes `50c = 1`, increments `P+0xb8`, `P+0xbc` |
 
+Division faults (library `__rt_sdiv` / `__rt_udiv`, disassembly): `0x2104` divides by host `904` and by the macroblock
+count, so `904 == 0` or a zero count traps; `0x26f8` divides by `2 * (int) Qstep`, which is 0 for slice QP 0..3
+unless the average statistic is at its floor `0x10`; `0x2088` with a negative remainder would index before the table
+(unreachable, the slice QP is masked to 0..63). `0x2320` takes `P+0xbc` as its fourth argument and reads the engine QP
+(`0x550140`) back only when it is above 0. In `0x2628` the clamp to 0 follows the N flag of the add (not a signed
+compare) and the tests on the P-since-I counter are unsigned. `0x2104` with `idr_period == 0` uses divisor 9 and
+numerator 6 times the I target.
+
 ### Host registers in the rate path
 
 | Host reg | Role (firmware `P` field) |
@@ -712,6 +902,8 @@ rate-control state of the stream**, not a report to the host. The host reads its
 | 18 | `+48` | `ctx+0x8c` | QP floor margin |
 | 19 | `+4c` | `ctx+0x6c` | maximum QP |
 | 20 | `+50` | `ctx+0x70` | minimum QP (current floor) |
+
+On load (`0x27d4`) word 16 (`+0x40`) is read twice, into both `ctx+0x2c` and `ctx+0x48`; word 17 (`+0x44`) is stored but never loaded.
 
 The record is only used when rate control is on (`P+0xc4` or `P+0xc8`) and the bypass flag `ctx+0x288` is 0.
 
@@ -766,5 +958,24 @@ All other host registers the two programs use are the same.
 | 1.0.1 encoder program differs (`0x4624` bytes; stream indices 0..4; reads `c00/c04`; reports in `a04`) | 1.0.1 iPod OS image, program at body offset `0x6eac9c`, length word before it | observed |
 | With a test program in the core no DMA form moves data between SDRAM and the core; closing the engine after timed-out inbound transfers can stop the whole device | device tests with a test program in the core | device |
 | Bits a test program writes after the stream start (`008=3`, `000=1`) reach the host's ring; its mode-5 copies do not reach SDRAM; the original program's mode-5 statistics copy does | device tests; `firmware 0x2018`, `0xd60`, `0x25c` | device |
+| Writer ports: raw bits wait `+34 != 0`, Golomb waits `+34 == 1`; raw-bit order `+40`, `+3c`, `+38`; kick polls `+50`/`+20` never cleared by the program; `+00` sequence at header, frame and slice set-up | `firmware 0x4374`, `0x3874`, `0x3894`, `0x3d04`, `0x38b0`, `0x4084`, `0x352c` | observed |
+| Flush order, `038` second read only if the first is not `0x80`, `+dc` skipped when the second argument is 1 | `firmware 0x25c`, `0xcfc`, `0x1078` | observed |
 | Header flush skips the `5200dc` wait (argument 1); end of frame waits | `firmware 0xcfc`, `0x1078`, `0x25c` | observed; device |
+| Mode-5 copies of the program all run inside the `52005c` busy window (`2`, `1` ... `0`, `520060` acknowledge) | `firmware 0x1834`, `0xd10`, `0xd60`, `0x1a7c` | observed |
+| Host gates clock `0x42` off between jobs, unmasks the IRQ before the IRQ reset, issues command 1 in the first job after `90c/900`, never writes `c08` | `osos mem:0x08113fa8`, `0x0812d21c`, `0x081d0644..0x081d066c`, `0x08120b9c` | observed |
 | Answering `10c` with `510=1` and no further bus access, and the host waiting for `514` bit 5 before gating clocks, closes the engine without stopping the device | device test, 22 closes | device |
+| Core accesses below `0x100`: writes `000/008/00c/010/014/020`, reads `030/038/03c`, nothing else; no reads of `008/00c/014/020`, no `030` read before a start; write order `020, 014, 00c, 008, 000`; loop `030 != 1` | register-tracking scan and reading of the whole image; `firmware 0xd84..0xda8`, `0xdf4..0xe5c`, `0x1a7c`, `0x2018` | observed |
+| Statistics copy: 40 two-word warm-up copies, 4 chunks of `0x20` words, 1 word; table padded from the slice count with five words per index; vector rows `c08[30:0] + row*0x280`, chunks of `0x20` words plus a tail | `firmware 0xd60..0xe5c`, `0x1a7c` | observed |
+| Mode-3 start is outstanding for every mode-5 copy | `firmware 0x2018`; device rows above | observed; completion behaviour device |
+| Host registers read per header and frame command | `firmware 0x924`, `0x3b88`, `0x4084`, `0x2104`, `0x2580`, `0x2320` | observed |
+| Quirks: stream index beyond 3 overruns the slot array, 8 the record array; alpha/beta repacked to 4 bits; `P+0xb0` covers the whole macroblock header; load of record word 16 reads it twice; division faults | `firmware 0x16c`, `0x18e4`, `0x352c`, `0x3d04`, `0x27d4`, `0x2104`, `0x26f8` | observed (disassembly over decompiler) |
+| Clock gate `0x42` entry, two read-modify-writes under IRQ/FIQ mask, only 3 callers, off after `108/134` and between jobs | `osos mem:0x220002f4`, `0x08551db0`, `0x08113fac`, `0x081d05ae`, `0x081d0abe` | observed |
+| Core state while gated | not tested | open |
+| IRQ line unmasked in the constructor before the IRQ reset; dispatcher reads and acknowledge writes | `osos mem:0x0812d21c`, `0x0818e6ca`, `0x22006638` | observed |
+| Events are counting semaphores, never cleared, waits without timeout, no polling loops in the driver | `osos mem:0x082187e4`, `0x0820f974`, `0x220030d8`, `0x220030f0` | observed |
+| Upload, configuration and restore order; close order without `048`/`600`/`514` | `osos mem:0x08120bf0`, `0x081207e8`, `0x0812d100`, `0x08113d1a`, `0x0812d1d4` | observed |
+| Job order, conditional reads of `918`, `a00`, `a04`; output cursor read order `018, 01c, 034, 024`; wrap copy with overshoot limit `0x38400` | `osos mem:0x081d0588`, `0x0812d0b0`, `0x081916cc` | observed |
+| Slack after `01c` exists because the engine can write past it | wrap copy limit | inferred |
+| Arena `0x2f8000`, seven blocks, 1 KiB alignment, uncached alias with bit 31, masked addresses, `348` bit 31 enable | `osos mem:0x08135df8`, `0x0827ee88`, `0x08552610`, `0x0823ec30`, `0x08120b94` | observed |
+| Coherence rests on the uncached alias | no cache maintenance in the open, job or close paths | inferred |
+| Host never writes `008`, `c08`, `010`, `03c`, `030`, `50c`, `510`, `504`; never sends commands 4 or 5 | 55 literal-pool loads and 3 base constructions over four address ranges | observed (bounded negative) |
