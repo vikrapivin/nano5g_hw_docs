@@ -91,7 +91,7 @@ streams correctly is not tested.
 |---|---|
 | `1078 = 1` / `1078 = 3` | decode one `ue(v)` / `se(v)` code (`mem:0x0820d37c`, `0x081fb944`): poll `107c` bit 7; `107c[5:0]` is the code length; with bit 6 clear the value is `107c >> 8`, with bit 6 set the code is long and the value is read through the raw-bit window `1400 + 4*(len+1)` |
 | `0400..07ff` | prediction weights (`mem:0x08303144`), layout below |
-| `3400..37ff` | weight flag words, same indexing as the weights |
+| `3400..37ff` | weight flag words, same indexing as the weights: bit 0 marks a luma weight of +128, bits 0/1 a Cb/Cr weight of +128 (the weight byte `0x80` alone is -128). The iPod OS writes them for explicit B only (`mem:0x08303144`); the decoder honours them for explicit P as well (device) |
 | `0200 + 4*i` | temporal-direct scale factor per list-0 entry (12 bits) |
 | `2800`, `2900` | 8x8 scaling lists, Intra Y and Inter Y, 64 words |
 | `2a00 + 0x40*k` | 4x4 scaling lists `k` = Intra Y, Cb, Cr, Inter Y, Cb, Cr, 16 words |
@@ -238,3 +238,4 @@ layer programs work on this silicon, completion timing.
 | `1038` is the first-macroblock row, `103c` the column | `mem:0x082eddf0` divide; executed with `first_mb` 37, width 20: `1038=1`, `103c=17` | observed, dynamic analysis |
 | Per-slice sequence; lists, scale factors, weights, scaling-list and `1048`/`1068` layouts | `mem:0x082e22b4`, `0x082eddf0`, `0x08303f00`, `0x08303144`; 33 streams, 1,866 slices executed | observed, dynamic analysis; `1048` bits 0, 1, 4, 5 inferred |
 | Physical format limits on silicon | not established | not tested |
+| Explicit P with a +128 weight (default at denominator 7) decodes exactly only with the `3400`/`3480` flag words set; without them every such picture and those predicted from it differ | device: four weighted clips, every picture compared, 0 mismatches with the flags, 47..78 without | device |

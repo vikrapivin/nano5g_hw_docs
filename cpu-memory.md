@@ -151,6 +151,15 @@ What the device test rules out and what it does not:
 Test 6 shows nothing that holds data between `0x22070000` and `0x220fffff`
 (reads 0, writes are lost, no mirror of lower SRAM).
 
+Test 7 (speed and use, device): a plugin timed one read per 32-byte line over
+each 64 KiB block, 16 passes, through the cached alias at `0x22000000`, and a
+dependent-load chase over the top 16 KiB of each block above `0x2202ffff`
+(written first, so those blocks also hold a 16 KiB permutation). Stride times:
+`0x22000000` 4508 µs, `0x22010000` 14186 µs, `0x22020000` 14324 µs,
+`0x22030000..0x2206ffff` 4493..5022 µs; chase 1916..1927 µs in every upper
+block. The blocks at `0x22010000` and `0x22020000` are about three times slower
+to stream than the others; the upper four blocks match the first.
+
 Conclusion: at least 320 KiB is in use by the iPod OS; the bootloader declares
 448 KiB; one device probe at the top of that range behaves as distinct RAM, and
 nothing above `0x2206ffff` holds data up to the end of the 1 MiB section. The
@@ -173,3 +182,4 @@ SRAM is 448 KiB (`0x22000000..0x2206ffff`).
 | In a simulated boot of the bootloader image, PreEfi completes the SDRAM controller initialization and the boot continues with code and data in SDRAM (DXE phase at `0x08000000` upward) | dynamic analysis of the bootloader image | dynamic analysis: confirms the sequence is complete and in order; the simulation answers status polls without DRAM timing, so it does not validate the timing values |
 | The diagnostics sleep code (run from SRAM) cleans and invalidates the data cache with the same set/way loop as PreEfi, drains the write buffer and disables both caches before switching SDRAM off | `diag IramRoutines.pe+0x220..0x2b8`; PreEfi `bootloader mem:0x2200a2e4` | observed |
 | Diag `r/w/o/a` 32-bit access, no checks | `diag TestDirectMemoryRW.pe+0xb54..0xba8` | observed |
+| SRAM blocks `0x22010000` and `0x22020000` stream about 3x slower than `0x22000000` and `0x22030000..0x2206ffff`; the upper four blocks hold a written permutation | device test 7 | device |
