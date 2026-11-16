@@ -18,7 +18,7 @@ names such as `DREX` are working names.
 | CPU | ARM1176/ARMv6, CP15 | ARM and Thumb code, banked CPSR modes, cache and MMU operations below. ARM1176JZF-S is the working identification. |
 | Mask ROM | `0x20000000..0x2000ffff` | 64 KiB image, executes here. Aliasing at reset vector VA/PA zero not measured. |
 | SRAM, ROM-used range | `0x22000000..0x2202ffff` | 192 KiB addressed by ROM code, stacks and buffers. |
-| SRAM, used by later stages | `0x22000000..0x2206ffff` | Declared 448 KiB (`0x70000` bytes) by the bootloader; evidence and limits in [SRAM size](#sram-size). |
+| SRAM, used by later stages | `0x22000000..0x2206ffff` | 448 KiB (`0x70000` bytes): declared by the bootloader; nothing holds data above it (device); evidence in [SRAM size](#sram-size). |
 | SDRAM | `0x08000000..0x0bffffff` | PreEfi returns base `0x08000000`, size `0x04000000` (64 MiB) without probing capacity. |
 | SDRAM uncached VA alias | `0x88000000..0x8bffffff` | bootloader page tables map it to `0x08000000..0x0bffffff`. Bit 31 is a software alias; a DMA engine may need the translated address. |
 | Peripheral window | `0x38000000..0x3fffffff` | individually decoded blocks; not every address exists |
@@ -136,6 +136,7 @@ one device test. Each source and what it shows:
 | 3 | `bootloader Bds.pe+0xc9a..0xcb6` | clears `0x14` bytes at `0x2206ff18` (literal at `Bds.pe+0xd2c`) through a boot-service call, then stores a word at `0x2206ff10` | Firmware writes data near the top of the declared range and relies on it. |
 | 4 | iPod OS scatter table (`osos mem:0x22005fa0`, copied by `osos mem:0x22005ec8`) | copies `0x20000` bytes to `0x22030000`; a further entry at `0x22050000` has length 0 | The iPod OS uses SRAM up to `0x2204ffff` (320 KiB). It needs at least that much. |
 | 5 | Device test (read-only first, then write) | reads `0x2206ff00..0x2206ff3f`, writes a pattern, reads it back, and checks `0x2200ff00`, `0x2202ff00`, `0x2203ff00` for the pattern | The pattern reads back at `0x2206ff00` and does not appear at the three lower addresses. |
+| 6 | Device test (uncached alias `0x62000000`) | fills `0x22030000..0x2206ffff` with words that each hold their own offset; then reads 16 bytes at each 64 KiB step from `0x22070000` to `0x220f0000`, compares them with every lower 64 KiB block and, where they match none, writes a word there, reads it back and restores it | All nine places above `0x2206ffff` read zeros, none is a mirror of a lower block, and a write does not hold at any of them. |
 
 What the device test rules out and what it does not:
 
@@ -145,12 +146,15 @@ What the device test rules out and what it does not:
   256 KiB SRAM seen through an address mirror.
 - Does not rule out a `0x50000` (320 KiB) mirror, which would alias onto
   `0x2201ff00`; that address was not checked.
-- Says nothing above `0x2206ff40`: the SRAM could be larger than 448 KiB.
 - No full memory test of `0x22030000..0x2206ffff` was run.
 
+Test 6 shows nothing that holds data between `0x22070000` and `0x220fffff`
+(reads 0, writes are lost, no mirror of lower SRAM).
+
 Conclusion: at least 320 KiB is in use by the iPod OS; the bootloader declares
-448 KiB; one device probe at the top of that range behaves as distinct RAM.
-448 KiB is the best-supported figure, not a measured capacity.
+448 KiB; one device probe at the top of that range behaves as distinct RAM, and
+nothing above `0x2206ffff` holds data up to the end of the 1 MiB section. The
+SRAM is 448 KiB (`0x22000000..0x2206ffff`).
 
 ## Finding ledger
 
@@ -159,6 +163,7 @@ Conclusion: at least 320 KiB is in use by the iPod OS; the bootloader declares
 | 64-MiB SDRAM contract | `bootloader mem:0x2200b4b4` | observed; no capacity probing |
 | Boot ROM addresses only `0x22000000..0x2202ffff` (192 KiB) | ROM memory map, stacks and buffers | observed |
 | Bootloader declares SRAM base `0x22000000`, size `0x70000` (448 KiB) | `bootloader SystemConfig.pe+0x9e8..0x9f6` | observed (declaration) |
+| Nothing holds data at `0x22070000..0x220fffff`: reads 0, a write does not hold, no mirror of lower SRAM (nine places, 64 KiB apart) | device test 6 | device |
 | Bootloader reserves `0x22001000` + `0x6f000` (to `0x22070000`) for the DXE phase | `bootloader mem:0x2200aabe..0x2200aace` | observed (declaration) |
 | Bootloader writes data at `0x2206ff10` and `0x2206ff18` | `bootloader Bds.pe+0xc9a..0xcb6` | observed |
 | iPod OS loads code/data up to `0x2204ffff` (320 KiB) | `osos mem:0x22005fa0` scatter table, copied by `osos mem:0x22005ec8` | observed |

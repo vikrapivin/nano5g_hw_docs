@@ -300,6 +300,34 @@ load/store, and no coprocessor access (no CP15 cache/MMU/ID reads, no VFP). The
 rate-control floating-point arithmetic is done by the C library's software
 floating point. Observed in the disassembly of all 4,368 instructions; the core type and clock are not identified.
 
+**Byte lanes** (device tests: 843 single-instruction tests in five test programs, and a word read back by
+byte, halfword and word loads). Word loads and stores keep the value of a word between host and core. Byte and
+halfword *loads* read the big-endian lane of their word (BE-32): a byte load from the address of a word holding
+`0xa3a2a1a0` returns `0xa3`, a halfword load `0xa3a2`, `swpb` returns `0xa3`. Byte and halfword *stores* write the
+little-endian lane: a byte store of `0xee` to the same address makes the word `0xa3a2a1ee`, a halfword store of
+`0xbeef` makes it `0xa3a2beef`. A byte stored at an address therefore reads back from that address only after
+the address is changed by `^ 3` (byte) or `^ 2` (halfword) for the store or the load. A word load from an address
+1, 2 or 3 bytes past a word boundary returns the aligned word rotated right by 8, 16 or 24 bits (ARMv4). `swp` and
+`swpb` return the old word or byte but leave memory unchanged. `muls` and `mlas` set N and Z and clear C. All other
+data-processing, shift, multiply, branch, `ldm`/`stm` and word load/store forms tested give the ARMv4 result.
+
+**Core address map** (device test: a program in the core read four words at every 16 KiB of its 24-bit address
+space while the host filled `0x22030000..0x2206ffff` with words naming their own SRAM offset):
+
+| Core addresses | What a read returns |
+|---|---|
+| `0x000000..0x01ffff` | local RAM (the 32 KiB space, four times) |
+| `0x500000..` | the core's registers (not swept) |
+| `0x510000..0x52ffff`, `0x550000..0x55ffff`, `0x564000..0x56ffff` | zeros |
+| `0x600000..0x60ffff` | table RAM, 64 KiB, not repeated above it |
+| every other address up to `0xffffff` | the instruction word at the load's address + 8, the word the core fetched last |
+
+No read faulted, and no read returned a host SRAM word, tagged or live, from any of the seven 64 KiB SRAM
+blocks. Patterns the core left in its local RAM and table RAM did not appear anywhere in the host's SRAM: the
+core and the host share no internal SRAM. A load that returns the word fetched at its own address + 8 fits a
+three-stage pipeline that fetches during the load's memory cycle, as an ARM7TDMI does, as do the loop timings
+under Clock (inferred).
+
 **Local RAM** (observed in the start-up code, size inferred):
 
 | Range | Content | Evidence |
@@ -384,7 +412,8 @@ valid buffer:
 | Test | Result | Type |
 |---|---|---|
 | Start-up | the core did not reach its first marker within 500 ms after the upload; it started once the host wrote `108=1` and `134=1` | device |
-| Local RAM | writes at `0x8000` read back at `0x0000`: 32 KiB, wrapping | device |
+| Local RAM | reads at `0x8020..0x802c` return the words at `0x20..0x2c` (the address space wraps at `0x8000`); reads at `0x6020..` do not. Whether `0x6000..0x7fff` holds stores is not shown by this test | device |
+| Local RAM above `0x6000` | a program whose stack sat just below `0x8000` answered every command that does not touch the stack and none that does; a host transfer to `0x6400` read back, through the core, as other words; stores at `0x6000..0x7ffc` do not hold, at `0x5ffc` they do | device: 24 KiB |
 | Matrix words | host wrote `11111111..55555555` to words 0..4, the core read `111, 222, 333, 444, 55`; loop counts `0x4e20`, `0x30d40` arrived as `e20`, `d40`, and loop times scaled with the truncated counts | device |
 | `008=5`, 8 words, `020` = core RAM `0x3400` or table RAM `0x600000`; `014` truncated | `030` reads 1; the intended buffer is unchanged | device |
 | `008=3,0,1,2,6`, `020` in core RAM, `014` truncated | `030` never read 1 within 200,000 polls | device |
@@ -400,7 +429,7 @@ held the intended SDRAM buffer address:
 | Matrix words | all 32 words read back 12 bits from the host; values sent in 11-bit pieces arrive whole | device |
 | Clock | single loops: 98 M ALU, 51 M load, 34 M multiply instructions per second | device |
 | Host programs `008` (untouched, 3, 0, 1, 2, 4, 6), `00c`, `014` in SDRAM, `020` in core RAM or table RAM, `000=1`, with or without `110=1` | nothing arrives at `020`; with `110=1` the event bit 7 is raised; table RAM with `110=1` stopped the core | device |
-| Core reads SDRAM addresses `0x083b2200`, `0x883b2200`, `0x283b2200`, `0x483b2200` | each returns the word at local `0x2200` (the same as `0x003b2200`) | device |
+| Core reads SDRAM addresses `0x083b2200`, `0x883b2200`, `0x283b2200`, `0x483b2200` | each returns the word at local `0x2200` (the same as `0x003b2200`); in the later address-map test `0x3b2200` lies in a range with nothing behind it, where a read returns the last fetched instruction, so the match with local `0x2200` is not confirmed | device |
 | `008=5`, 8 words, `020` = table RAM `0x600000`, `014` in SDRAM | `030` reads 1; the SDRAM buffer is unchanged | device |
 | inbound `008` = 3, 0, 1, 2, 6, 32-word chunks, `020` = table RAM `0x600000`, `014` in SDRAM | `030` never reads 1 within 200,000 polls | device |
 | inbound `008=4`, same | `030` reads 1; the local buffer does not hold the SDRAM data | device |
@@ -653,13 +682,37 @@ The original program's slice-statistics copy arrives (130 of 136 poisoned words 
 after one frame) (device).
 
 Host DMA into the core's RAM (`000` with `00c/014/020` from the host) lands while the core is stopped
-(stop request answered, with or without the disable that follows) and inside the `110` bracket the program
-upload uses; without the bracket, or into a running core, nothing arrives (device). No DMA event is raised
+(stop request answered) and inside the `110` bracket the program upload uses; without the bracket, or into a
+running core, nothing arrives (device). With stop, DMA, disable, restart, 8 of 8 blocks of 8 KiB arrived and the core
+kept answering. With the disable (`134` cleared, `130` pulsed, `108` cleared) before the transfer, test
+programs whose stack lay above `0x6000` (outside the RAM that holds stores, below) lost the core after the
+first blocks; a program with everything below `0x6000` received all 128 words of such a transfer and kept
+answering (device, three runs). Likewise a restart 50 µs after a 64-byte transfer started lost the core for a
+program with its stack above `0x6000`, while restarts 100..2,000 µs after the start of a 256- or 2,048-byte
+transfer keep the core when the program lies below `0x6000` (12 tries at each of 9 times: the words that had
+arrived are there, 2 of 12 transfers of 2,048 bytes partly at 100 µs, all whole from 150 µs on) (device).
+A transfer into a core that is halted but still enabled (stop answered, `134` set) now and then lands one
+word late with no error: in 1,000 cycles of stop, 256-byte transfer, restart, every transfer that started at the
+4 KiB-aligned local address `0x5000` (about 125) was checked, and 78 of them read back one word further on, while
+transfers starting elsewhere landed in place; 4 of the 1,000 restarts lost the core (device). With the disable
+(`134` cleared, `130` pulsed, `108` cleared) between the stop answer and the transfer, the same 1,000 cycles had no
+transfer land wrong, none of the 125 starting at `0x5000`, and no restart lose the core; 552 such restarts while
+decoding two clips lost none either. After the disable `a00` and `a04` read 0 (device).
+Transfers of up to
+2,048 words are the largest proven; a single 9,312-byte transfer into a stopped core did not deliver its last
+1,120 bytes as far as the program could tell (device, inferred from the program's state). No DMA event is raised
 for such a transfer. 8 KiB take between 250 and 500 µs (none of 2048 words after 100 µs, 2047 after
 250 µs, all after 500 µs); a core restarted immediately after the start holds only the first 80 words.
 Host DMA with the `110` bracket into a running core lost the core in one run and stopped the whole device in
 another (device). Restarting a stopped core (`134` cleared, `130` pulsed, `108` cleared, then `108=1`, `134=1`)
 runs it again from its reset vector with its RAM kept (device).
+After such a restart a stop request no longer raises the idle event (`514` bit 5): a test program that answers
+it with `510=1` raised it 16 µs after the first request and never after a restart (device). Every bit the host
+writes to `c0c` reaches the core: each of bits 8..31 alone and `0xffffff00`, `0xfe`, `0x00ff00f0` read back
+exactly in the core (device). A host write to `a00` does not change it: a host write of 0 reads back the
+program's value at once (device). A restart of a program already in RAM reaches its first register write in
+1..2 µs; the first start after an upload takes 45..175 µs (device: a fresh value the host leaves in `c0c` before
+each restart comes back through the core every time).
 Raw 32-bit words written through the raw-bit port after a writer flush come out one bit late: the ring holds
 a leading 1 bit and then the words (`0x0bad5540` arrives as `85 d6 aa a0`); 16 KiB written that way take
 1.7 ms once the stream runs, and with emulation prevention on the writer counts 1024 escape bytes for that
@@ -963,7 +1016,10 @@ All other host registers the two programs use are the same.
 | Exception stubs jump through uninitialised RAM pointers `0x5fc4..0x5fe0` | `firmware 0x24..0xec` | observed |
 | ARMv4T code, no coprocessor or ARMv5+ instructions, software floating point | whole-image disassembly | observed |
 | Local RAM layout; at least 24 KiB | scatter table `0x474c`, heap `0x3528`, stacks `0x34f4`, vector literals | observed layout, inferred size |
-| Local RAM is 32 KiB and wraps at `0x8000` | test program write/read sweep | device |
+| The local address space wraps at `0x8000` | test program read scan | device |
+| Local RAM repeats up to `0x01ffff`; `0x510000..0x52ffff`, `0x550000..0x55ffff`, `0x564000..0x56ffff` read 0; table RAM is 64 KiB; every other core address up to `0xffffff` returns the instruction fetched at the load's address + 8, without a fault | address-map test (reads every 16 KiB) | device |
+| The core and the host share no internal SRAM: no core address returns host SRAM words, and the core's local RAM and table RAM words do not appear in host SRAM | address-map test with self-naming SRAM words, live-SRAM comparison and a host scan of all 448 KiB | device |
+| Stores at `0x6000..0x7fff` do not hold; the usable local RAM is 24 KiB (`0..0x5fff`) | store and read-back at eight addresses from `0x5f00` to `0x8000` | device |
 | Core starts only after host `108=1`, `134=1` | test program boot marker | device |
 | Matrix words 0..3 hold 12 bits and word 4 holds 8 | test program echo of host-written values | device |
 | With `014` in the first 4 KiB: mode 5 completes, modes 0..3 and 6 time out, modes 7 (`020` core RAM) and 3 (`020` table RAM) hang the device | test program | device |
@@ -976,8 +1032,29 @@ All other host registers the two programs use are the same.
 | Bits a test program writes after the stream start (`008=3`, `000=1`) reach the host's ring | device test; `firmware 0x2018`, `0x25c` | device |
 | Mode-5 copies land with each 32-bit word byte-swapped (big-endian), from boot on; host and core keep separate DMA register copies | device tests (reimplementation of the program with marker copies; core and host read-back) | device |
 | Host DMA into the core's RAM lands while the core is stopped and inside the `110` bracket, without a DMA event; 8 KiB in 250..500 µs; restart keeps RAM | device tests | device |
+| A host DMA started after the disable lost the core only for programs whose stack lay above `0x6000`; with the program below `0x6000` the transfer lands (128/128 words) and the core answers; stop, DMA, disable, restart keeps it | device tests (held-core input; pipeline program in two layouts) | device |
+| A restart while a host transfer is still arriving keeps a program that lies below `0x6000`; the words that arrived by then are in place (256 B whole at 100 µs; 2,048 B whole in 10 of 12 at 100 µs, all from 150 µs) | device test (restarts 100..2,000 µs after the start, 12 each) | device |
+| A restart of a resident program answers in 1..2 µs; the first start after an upload in 45..175 µs | device test (fresh `c0c` value echoed by every restart) | device |
 | Host DMA with the `110` bracket into a running core loses the core or stops the device | device tests | device |
+| After a restart (`134` cleared, `130` pulse, `108` cleared, `108=1`, `134=1`) a stop request answered with `510=1` raises no idle event | device test (8 stop/restart cycles: 16 µs once, then none) | device |
+| All 32 `c0c` bits written by the host reach the core | device test (every bit 8..31 alone, three mixed words) | device |
+| A host write to `a00` leaves its value | device test (write of 0, read back at once) | device |
 | Mode-5 copies byte-swapped by the core before the copy arrive in the host's order, in every size up to 1024 words | device test | device |
+| Mode-5 copies of words the core stored into the table-RAM window (`0x600000`) arrive in the host's order without a byte swap (1, 6 and 256 KiB to 32-aligned SDRAM addresses); with the core's byte swap every word arrives swapped | device test (pattern through the window, 32-word transfers, 17 MB/s) | device |
+| A mode-5 copy to an SDRAM address 4 bytes off an 8-byte boundary does not land in order | device test (1 KiB at +4, with and without the swap) | device |
+| A host transfer into the core reads its source from the address with bits 2:0 cleared (sources at +4, +12, +20, +28 delivered the words from +0, +8, +16, +24) and writes one word more than asked, at the local address asked for | device test (5 transfers, 1..1016 words) | device |
+| Stores by the core hold at `0x5f00` and `0x5ffc`; at `0x6000`, `0x6400`, `0x7000`, `0x7c00`, `0x7ffc` a stored word reads back as another value (and changes again on the next read); `0x8000` reads and writes the word at `0` | device test (store, read back, restore) | device |
+| 1,000 cycles of stop, 256-byte host transfer (282 µs wait), restart, check: two cycles found other words, one lost the core | device test | device |
+| A restart after a stop with a 256-byte host transfer (waited for in full) now and then never boots (the core copies no nonce and writes no boot word; a second restart does not boot either) until the program is uploaded again: 1 of 60, 1 of 500 and 5 of 216 such cycles in three tests; 0 of 500 restarts without a transfer; no word arrived wrong | device tests (stop, transfer, restart; checked by the core) | device |
+| The core's byte and halfword loads read the big-endian lane of their word (BE-32), while words keep their value between host and core: a program built little-endian that loads a byte from a word holding 1 reads 0, reads a header's 16-bit field 20 as 264; a four-instruction Thumb routine computing 3x + 1 returned x + 5 (its halfword pairs fetched swapped) | device tests (control-block tag and header read by byte loads; a word read by bytes and halfwords; `ldrb`/`ldrsb`/`ldrh`/`ldrsh`/`swpb` in every lane) | device |
+| The core's byte and halfword stores write the little-endian lane of their word: bytes `11 22 33 44` stored at ascending addresses read back as the word `0x44332211`; a byte store to lane 0 of `0x13121110` gives `0x131211ee` | device tests (`strb` in 12 addressing forms and 4 lanes, `strh` in 2 lanes) | device |
+| A word load 1..3 bytes past a word boundary returns the aligned word rotated right by 8, 16, 24 bits; `swp` and `swpb` leave memory unchanged; `muls`/`mlas` clear C | device tests | device |
+| Thumb code runs on the core (a Thumb routine built in the core's byte order returned 3x + 1) | device test | device |
+| A host transfer writes on to the next 32-byte boundary of its local destination (the words after an odd-ended transfer change) | device test (transfers of 3, 37, 504 words from 8-aligned sources) | device |
+| Into a halted, enabled core a transfer starting at the 4 KiB-aligned local address `0x5000` lands one word late on most tries (78 of about 125); 4 of 1,000 restarts after such transfers lose the core | device test (1,000 cycles of stop, 256-byte transfer, restart) | device |
+| With the disable between the stop answer and the transfer no transfer lands wrong (0 of 1,000, 0 of 125 at `0x5000`) and no restart loses the core (0 of 1,000; 0 of 552 while decoding); `a00` and `a04` read 0 after the disable | device tests (same cycles; two-clip decode) | device |
+| A mode-5 copy of an odd number of words writes one word more | device test (1, 3, 33 words) | device |
+| A mode-5 copy to an address 8 bytes off a 32-byte boundary lands in order; 4 bytes off it lands one word early | device test (fill at +4, +8, +16) | device |
 | After a writer flush, raw bits written next come out one bit late (a leading 1 bit) | device test | device |
 | The core is an ARM7TDMI-class CPU without CP15 (MRC p15 returns the prefetched instruction word); CP14 debug comms present (`0x70000000`) | device test | device |
 | Writer ports: raw bits wait `+34 != 0`, Golomb waits `+34 == 1`; raw-bit order `+40`, `+3c`, `+38`; kick polls `+50`/`+20` never cleared by the program; `+00` sequence at header, frame and slice set-up | `firmware 0x4374`, `0x3874`, `0x3894`, `0x3d04`, `0x38b0`, `0x4084`, `0x352c` | observed |
