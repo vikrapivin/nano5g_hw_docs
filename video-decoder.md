@@ -128,10 +128,9 @@ size. The DPB size is derived from the level and the frame size
 (`mem:0x082f7c34`, table `mem:0x08467c94`) and capped at 16 frames. The playback
 capability list that the device reports (`mem:0x0800784c`) is narrower: H.264
 profile Baseline level 3.0 up to 720x480 (640x480 for the low-complexity
-entry), and MPEG-4 profile-level 3 up to 720x576. No MPEG-4 Part 2 decode path
-was found (bounded search: codec strings, MPEG-4 start codes, IDCT constants);
-the MP4 reader accepts `mp4v` sample entries with object type `0x20`
-(`mem:0x081edc78`).
+entry), and MPEG-4 profile-level 3 up to 720x576. MPEG-4 Part 2 and H.263 are
+decoded by a separate engine at `0x39600000`, described below; the MP4 reader
+accepts `mp4v` sample entries with object type `0x20` (`mem:0x081edc78`).
 
 ## Main and High profile programming
 
@@ -197,8 +196,10 @@ reference picture including reference B pictures, `1044` list-1 count minus 1
 (B) or `ffffffff`, `10cc` `cabac_init_idc` (0 for CAVLC and I slices). The
 slice header is consumed to its last bit; CABAC alignment bits are left to the
 engine. The PPS High-profile tail is parsed only while `1508` reports more
-RBSP data. `10e0`/`10e4` are written only when the iPod OS requests a second
-output copy of the picture.
+RBSP data. `10e0` is written on the first slice of every picture, before the
+plane descriptors: 0 without a second output copy, otherwise the second-output
+value (`osos mem:0x082ee40c`, called from `mem:0x082e22b4`); `10e4` is written
+only with a second copy.
 
 Slice start is `mem:0x082eddf0`; completion/acknowledge is
 `0x082df3c8`/`0x082f812c`.
@@ -219,9 +220,130 @@ On completion:
 On error or close: disable IRQ35, acknowledge, reset and gate before freeing
 DMA memory.
 
-Not known: reset/status bit meanings, motion-plane semantics, MPEG-4 hardware
-use, whether the CABAC, B-slice, interlace and High-profile modes the register
-layer programs work on this silicon, completion timing.
+Completion status `1074` as the iPod OS driver reads it (`osos mem:0x082f812c`; error messages at
+`osos mem:0x0845be68..0x0845c014`; observed):
+
+| `1074` | Meaning | iPod OS action |
+|---|---|---|
+| 0 or 1 | slice done | next slice |
+| bit 1 | VLC error | core reset (`1004 = 0x3e0`, poll until 0, at most 10,000 polls, `osos mem:0x082ee0f8`), then the next slice of the same picture |
+| bit 2 | macroblock type error | same |
+| bit 3 | sub-macroblock type error | same |
+| bit 4 | coded block pattern error | same |
+| bit 5 | "idf" error | same |
+| bit 6 | delta QP error | same |
+| bit 7 | time-out | core reset, the stream stops |
+
+If the `3e0` reset does not read back 0 within the poll limit, the driver ends the picture and skips to
+the next IDR. On the device a four-slice picture now and then ends with one of bits 1..6 set; that the `3e0`
+reset followed by the next slice recovers the picture is not yet device-tested.
+
+Not known: the sub-blocks the reset bits 9:5 select, motion-plane semantics, whether the
+interlace (field and MBAFF) modes the register layer programs work on this
+silicon, completion timing. CABAC, B slices, weighted prediction, the 8x8
+transform and scaling lists decode exactly on the device (finding ledger).
+
+## MPEG-4 Part 2, H.263 and JPEG decoder (`0x39600000`)
+
+A second decoding engine sits at **`0x39600000`**, **IRQ45**, OSOS clock ID
+**`0x40`** (clock-table entry `mem:0x08551d80`: `[40,0,0,0,8,0]`, i.e. clear
+`0x3c500068` bit 3 to enable). It is separate from the AVC engine at
+`0x38f00000`. The iPod OS drives it from two clients:
+
+- the MPEG-4 Part 2 / H.263 video decoder (open `mem:0x082d954c`, per-picture
+  decode `mem:0x082d96c8`);
+- the JPEG picture decoder (feeder `mem:0x080cb838`, decode loop
+  `mem:0x080e44b0`), used for still pictures.
+
+Both clients enable clock ID `0x40` and clear bit 0 of `0x3e000004` before use
+(`mem:0x082d954c`, `mem:0x080cb838`); the AVC path sets that bit (see "Slice
+start" above), so bit 0 selects between the two engines (inferred from the
+opposite use). Both register IRQ object `0x2d`; the video client's handler is
+`mem:0x082df430`, the JPEG client's `mem:0x080f585c`. The video handler
+acknowledges VIC1 with `0x38e0200c = 0x2000` (bit 13 = source 45).
+
+The register file has six windows. Offsets are relative to `0x39600000`; every
+entry is a 32-bit access seen in the iPod OS code named in the last column.
+
+| Offset | Use | Evidence |
+|---|---|---|
+| `00000` | top status: bit 1 block unit, bit 6 DMA unit, bit 8 VLD unit; written all-ones to clear | ISR `0x082df430` |
+| `00004` | interrupt mask: `142` (video), `40` (JPEG) | `0x082dfc1c`, `0x080e44b0` |
+| `0000c` | control: 0 at reset | `0x082699e4`, `0x080e44b0` |
+| `00010` | configuration: `80000000` at stream set-up, then OR `(mb_width-1)<<16 \| (mb_height-1)<<8`; JPEG writes `10100` | `0x082dfc1c`, `0x082e08f0`, `0x080e44b0` |
+| `0001c` | all-ones at reset | `0x082699e4` |
+| `0002c` | 2 at reset | `0x082699e4` |
+| `10000` | VLD status, all-ones to clear; 4 written before a picture | `0x082df7c6`, ISR |
+| `10004` | VLD interrupt mask `3f` | `0x082dfc1c` |
+| `1000c` | VLD start: `c` decodes the picture | `0x082d96c8` via `0x082df9e4` |
+| `10010` | picture parameters: bit 0 coding type, bits 2+ and 5+ two fcode fields, bit 11 one header field, bit 17 a VOL flag, bit 10 set for short-header (H.263) pictures | `0x082df7c6` |
+| `10014` | quantiser / short-header fields (MPEG-4: one 16-bit header field; H.263: two further fields packed at bits 6 and 15) | `0x082df7c6` |
+| `1001c` | 1 at stream set-up | `0x082dfc1c` |
+| `10034` | 0 per picture | `0x082df7c6` |
+| `1009c` | `field<<8 \| bits(mb_width*mb_height)<<4 \| field` (time-increment fields, inferred) | `0x082df7c6` |
+| `100a0`..`100a8` | one header byte, 0, 0 | `0x082df7c6` |
+| `30004` | each read drops one bit of the input (bit position mod 8 reads) | `0x082df7c6` |
+| `30020` | each read drops one byte (start address mod 4 reads, `mem:0x082df8e0`) | `0x082df7c6` |
+| `30100` | block-unit status, all-ones to clear; `20` before a picture | ISR, `0x082df7c6` |
+| `30104` | block-unit interrupt mask `14` | `0x082dfc1c` |
+| `3010c` | JPEG block hand-off `n<<3 \| 31` | `0x080f5114` |
+| `30110` | `2` (MPEG-4), `102` (H.263), `800` (JPEG reset) | `0x082df7c6`, `0x080e44b0` |
+| `41200 + 4*i` | 64-word matrix: MPEG-4 default intra matrix (video), JPEG luminance table (JPEG) | `0x082dfc1c`, `0x080e44b0` |
+| `41300 + 4*i` | 64-word matrix: MPEG-4 default inter matrix (video), JPEG chrominance table | as above |
+| `41800`, `41808` | JPEG block command / busy bit 1 | `0x080f5114` |
+| `41804` | `quant_type<<8 \| short_header<<7 \| 20` (video); `40` (JPEG) | `0x082df7c6`, `0x080e44b0` |
+| `50000` | motion-compensation status, all-ones to clear | `0x082ea720` |
+| `50010` | `c02 + 4*rounding` (video); `10` (JPEG) | `0x082df7c6` |
+| `60000` | DMA status, all-ones to clear; bit 1 = picture done (signals the waiting thread) | ISR |
+| `60004` | DMA interrupt mask `12` (video), `2` (JPEG) | `0x082dfc1c`, `0x080e44b0` |
+| `6000c` | DMA start: 3 starts the input fetch | `0x082df7c6` |
+| `60010` | `200` (video), `182` (JPEG) | `0x082e08f0`, `0x080e44b0` |
+| `60018`, `6001c` | input start / end bus address; end = start + length + `103` | `0x082df7c6` |
+| `60020`, `60024` | input buffer start / end | `0x082dfc1c` |
+| `6002c`/`60034` | reference picture luma / chroma, bus address with bit 31 cleared (`lsls #1; lsrs #1`); `60030`/`60038` written 0 | `0x082dfcda` |
+| `6003c`/`60044` | current picture luma / chroma, bus address with bit 31 cleared; `60040`/`60048` written 0 | `0x082dfcda` |
+| `6006c` | `mb_width<<16 \| mb_height` | `0x082e08f0` |
+| `60078`, `6007c`, `60080` | two buffer addresses and 0 at stream set-up | `0x082dfc1c` |
+
+Bus addresses are written with bit 31 cleared, as for the AVC engine.
+
+### Picture sequence (video)
+
+`mem:0x082d954c` opens the decoder. For codec byte `0x0b` it searches the
+decoder configuration for the visual-object-sequence start code `0x000001b0`
+and a video-object-layer start code `0x00000120..0x0000012f`, then parses the
+VOL (`mem:0x082eae9c`); for the other codec type it takes the picture size from
+two big-endian 16-bit words of the configuration and marks the stream as short
+header (H.263). Width and height are rounded up to macroblocks.
+
+`mem:0x082d96c8` decodes one access unit of at most `0x40000` bytes:
+
+1. Find the VOP start code `0x000001b6` (MPEG-4) and parse the VOP header in
+   software (`mem:0x082e13f8`; short header `mem:0x082dfabc`).
+2. If the picture is not coded, copy the reference picture (luma `w*h`,
+   chroma `w*h/2` bytes, `mem:0x081916cc`) and finish.
+3. Otherwise: reset (`mem:0x082699e4`), stream set-up with the MPEG-4 default
+   matrices (`mem:0x082dfc1c`; tables at `mem:0x084a5a68`, `mem:0x084a5b68`),
+   geometry (`mem:0x082e08f0`), reference and current frame stores
+   (`mem:0x082dfcda`, two stores that alternate), picture registers
+   (`mem:0x082df7c6`), DMA start, then the byte- and bit-skip reads that align
+   the engine to the first macroblock bit, then VLD start `c`.
+4. Wait for the DMA-done event with a timeout of `0x42` ticks; on timeout the
+   engine is reset.
+
+The chroma plane of a frame store is one plane of `w*h/2` bytes (inferred:
+interleaved Cb/Cr). Only I and P pictures fit two frame stores; B-VOP handling
+was not found.
+
+### JPEG
+
+The JPEG client scans markers in software (`mem:0x08205218`, `FF 00`
+stuffing, restart markers modulo 8), loads the quantisation tables into the
+two matrix windows (default tables at `mem:0x08466c18`, `mem:0x08466d18`) and
+hands decoded blocks to the block unit (`mem:0x080f5114`); the engine writes
+the output through its DMA window. Entropy decoding is done by the CPU in this
+client (inferred from the software bit reader); dequantisation, inverse
+transform and output are done by the engine (inferred).
 
 ## Finding ledger
 
@@ -239,3 +361,16 @@ layer programs work on this silicon, completion timing.
 | Per-slice sequence; lists, scale factors, weights, scaling-list and `1048`/`1068` layouts | `mem:0x082e22b4`, `0x082eddf0`, `0x08303f00`, `0x08303144`; 33 streams, 1,866 slices executed | observed, dynamic analysis; `1048` bits 0, 1, 4, 5 inferred |
 | Physical format limits on silicon | not established | not tested |
 | Explicit P with a +128 weight (default at denominator 7) decodes exactly only with the `3400`/`3480` flag words set; without them every such picture and those predicted from it differ | device: four weighted clips, every picture compared, 0 mismatches with the flags, 47..78 without | device |
+| Engine at `0x39600000`, IRQ45, clock ID `0x40` = `0x3c500068` bit 3 | `mem:0x082d954c`, `0x080e44b0`; clock table `mem:0x08551d80`; ISR `0x082df430` VIC1 bit 13 | observed |
+| `0x3e000004` bit 0 cleared for this engine, set for AVC | `mem:0x082d954c`, `0x080cb838` | observed; selector meaning inferred |
+| MPEG-4 Part 2 and H.263 (short header) decode path | `mem:0x082d954c`, `0x082d96c8`; start codes `1b0`, `120..12f`, `1b6` as call arguments | observed (code not defined as functions in the analysed image; read with a read-only disassembly) |
+| Register windows `00000`/`10000`/`30000`/`41200`/`50000`/`60000` and their writes | literal pools `mem:0x080e48d8..0x080e4908`, `0x082df46c..0x082df484`, `0x082df904..0x082df91c`, `0x082dfcb4..0x082dfcd0`, `0x082e0920`, `0x082ea73c..0x082ea748` | observed |
+| Bit/byte skip by reading `30004`/`30020` | read loop `mem:0x082df8e0` | observed |
+| MPEG-4 default intra/inter matrices loaded into `41200`/`41300` | `mem:0x082dfc1c`, tables `mem:0x084a5a68`/`0x084a5b68` | observed |
+| JPEG still decoding uses the same engine | `mem:0x080e44b0`, `0x080f5114`, ISR `0x08106794`; JPEG tables `mem:0x08466c18` | observed; split of work inferred |
+| Frame-store addresses written as the bus address with bit 31 cleared | `mem:0x082dfcda` (`lsls #1; lsrs #1`) | observed |
+| No B-VOP path | bounded: the two-store sequence in `mem:0x082d96c8` | inferred |
+| Engine responds on silicon | not established | not tested |
+| No reference to `0x396xxxxx` in the restore OS, bootloader or diagnostics images | bounded: aligned 32-bit literal scan of the disk, bootloader and diag images (the diag modules inside their firmware volume were searched only where they are stored uncompressed) | observed negative, bounded |
+| Completion status `1074`: bits 1..6 are slice-syntax errors (VLC, macroblock type, sub-macroblock type, pattern, "idf", delta QP) after which the driver resets the core with `1004 = 0x3e0` and continues with the next slice; bit 7 is a time-out | `osos mem:0x082e24a4..0x082e24f2` (one bit test per message), `mem:0x082ee0f8` | observed |
+| CABAC, B slices (spatial and temporal direct, pyramid), explicit/implicit weights, 8x8 transform, custom scaling lists, up to four slices per picture and pictures up to 1280x720 decode exactly with the programming above | device: 21 clips, every picture compared with a software decoder, 0 mismatches; four-slice pictures intermittently end with an error status | device |

@@ -31,6 +31,7 @@ Related single writes elsewhere in the boot chain:
 | `38501000` | 2 | PreEfi clock setup | unknown; not a DDR timing value |
 | `3e000008` | `1f` | SDRAM initialization ([sdram.md](sdram.md)) | unknown |
 | `3d500400` | 7 | SDRAM initialization ([sdram.md](sdram.md)) | unknown |
+| `3e00000c` | bits 1:0 = 3 (read-modify-write) | iPod OS start-up (`osos mem:0x220050d4` calls `mem:0x0801a7b0`, which calls `mem:0x081a2d6c` with 2) and a second initialisation routine that also restarts the microsecond timer (`osos mem:0x08126088`); the setter maps argument 0, 2, 4 to 0, 3, 1 and preserves bits 31:2. The bootloader never writes it; the disk image writes it at `disk mem:0x08052bba` | unknown |
 
 ## Unknown
 
@@ -44,3 +45,4 @@ cache interaction, idle acknowledgements and reset prerequisites.
 | Seven-step startup sequence | `bootloader mem:0x2200b46c` | observed |
 | Disk image repeats it | `disk mem:0x2200043c` | observed |
 | `38501000` = 2, `3e000008` = `1f`, `3d500400` = 7 | PreEfi clock setup and SDRAM initialization | observed, meaning unknown |
+| `3e00000c` bits 1:0 = 3 at iPod OS start-up and in a second initialisation routine, not written by the bootloader | `osos mem:0x081a2d6c` and its two callers; constant-tracking scan of all stores in the bootloader PreEfi/body and iPod OS images | observed, meaning unknown |

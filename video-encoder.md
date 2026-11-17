@@ -298,18 +298,74 @@ the whole image contains no ARMv5 or later instruction (no `clz`, `blx`, `ldrd`,
 `strd`, saturating or halfword-multiply forms), no long multiply, no halfword
 load/store, and no coprocessor access (no CP15 cache/MMU/ID reads, no VFP). The
 rate-control floating-point arithmetic is done by the C library's software
-floating point. Observed in the disassembly of all 4,368 instructions; the core type and clock are not identified.
+floating point. Observed in the disassembly of all 4,368 instructions.
 
-**Byte lanes** (device tests: 843 single-instruction tests in five test programs, and a word read back by
-byte, halfword and word loads). Word loads and stores keep the value of a word between host and core. Byte and
-halfword *loads* read the big-endian lane of their word (BE-32): a byte load from the address of a word holding
-`0xa3a2a1a0` returns `0xa3`, a halfword load `0xa3a2`, `swpb` returns `0xa3`. Byte and halfword *stores* write the
-little-endian lane: a byte store of `0xee` to the same address makes the word `0xa3a2a1ee`, a halfword store of
-`0xbeef` makes it `0xa3a2beef`. A byte stored at an address therefore reads back from that address only after
-the address is changed by `^ 3` (byte) or `^ 2` (halfword) for the store or the load. A word load from an address
-1, 2 or 3 bytes past a word boundary returns the aligned word rotated right by 8, 16 or 24 bits (ARMv4). `swp` and
-`swpb` return the old word or byte but leave memory unchanged. `muls` and `mlas` set N and Z and clear C. All other
-data-processing, shift, multiply, branch, `ldm`/`stm` and word load/store forms tested give the ARMv4 result.
+The device tests below identify it as an ARM7TDMI-class core: ARMv4T instructions, no CP15 (an `mrc p15`
+returns the prefetched instruction word), CP14 debug communications present, and loop timings of about 98 M ALU,
+51 M load and 34 M multiply instructions per second.
+
+**Instruction behaviour** (device tests: 843 single-instruction tests in five test programs). A word load from an
+address 1, 2 or 3 bytes past a word boundary returns the aligned word rotated right by 8, 16 or 24 bits (ARMv4).
+`swp` and `swpb` return the old word or byte but leave memory unchanged. `muls` and `mlas` set N and Z and clear
+C. All other data-processing, shift, multiply, branch, `ldm`/`stm` and word load/store forms tested give the ARMv4
+result. Byte and halfword accesses follow the byte-order rules below.
+
+### Byte order between the host and the core
+
+The host CPU is little-endian. Every path between host memory and the core moves whole 32-bit words and keeps
+each word's **value**: host DMA into the core's RAM, mode-5 copies from table RAM to SDRAM, and the registers both
+sides see (`c0c`, the matrix words `34c..`, `a00..a10`) (device: word patterns sent each way arrive with every
+word equal, 0 byte-swapped, in transfers of 1 word to 256 KiB). The core's word loads, word stores and ARM
+instruction fetches use the whole word, so word data and ARM code need no conversion.
+
+Only the core's sub-word accesses differ, and loads and stores differ from each other (device: every load and
+store form in every lane):
+
+| Core access at address `a` (word `W` at `a & ~3`, `k = a & 3`) | Bits of `W` used | `W = 0xa3a2a1a0` at `a`, `k = 0` |
+|---|---|---|
+| `ldr`, `str`, ARM fetch | all 32 | `0xa3a2a1a0` |
+| `ldrb`, `ldrsb`, `swpb` | `[31-8k : 24-8k]`: big-endian lane (BE-32) | `0xa3`; at `a+3`: `0xa0` |
+| `ldrh`, `ldrsh` (`k` = 0 or 2) | `[31-8k : 16-8k]`: big-endian half | `0xa3a2`; at `a+2`: `0xa1a0` |
+| Thumb fetch (`k` = 0 or 2) | big-endian half: the instruction at `a` is bits 31:16 | |
+| `strb` | `[8k+7 : 8k]`: little-endian lane | `strb 0xee` gives `0xa3a2a1ee` |
+| `strh` (`k` = 0 or 2) | `[8k+15 : 8k]`: little-endian half | `strh 0xbeef` gives `0xa3a2beef` |
+
+Neither a little-endian, a BE-8 nor a BE-32 ARM matches all rows: loads behave as BE-32, stores as little-endian.
+Consequences, each measured on the device:
+
+| Situation | What the core or the host sees |
+|---|---|
+| The core stores a byte at `a` and loads it back from `a` | a different byte; the byte stored at `a` is read at `a ^ 3` (halfword: `a ^ 2`). Bytes `11 22 33 44` stored at ascending addresses read back as the word `0x44332211` and, by byte loads, as `44 33 22 11` |
+| The host sends a byte stream (bytes `b0 b1 b2 b3` at ascending host addresses, word value `b3b2b1b0`) | core byte loads at `a..a+3` read `b3 b2 b1 b0`; with each word byte-swapped by the host before the transfer they read `b0 b1 b2 b3` |
+| The host sends a structure with little-endian 16-bit fields | a halfword load reads the other half of the word, a byte load the mirrored byte: a field holding 20 at bytes 14, 15 reads as 264; a word holding 1 read by a byte load at its address gives 0 |
+| The core builds a byte stream with stores at `a ^ 3` (bytes in the big-endian lanes, word value `b0b1b2b3`) and copies it out | without a swap the host reads `b3 b2 b1 b0`; with each word byte-swapped by the core before the copy, `b0 b1 b2 b3` (1,600 of 1,600 bytes in order); plain `strb` at `a` with the swap puts every byte at the mirrored lane |
+| Thumb code assembled little-endian | its two halfwords in each word run in swapped order (a routine computing 3x + 1 returned x + 5); with the halfwords of each word swapped it runs correctly |
+
+The original encoder program is ARM code built little-endian. It uses 3 byte loads and 1 byte store and no
+halfword access in 4,368 instructions; its results reach the host through word stores, the registers above and
+the bitstream writer, whose output ring holds the stream in byte order, most significant bit first (raw-bit
+example below).
+
+### Transfer and restart behaviour
+
+The device tests in the rest of this section give the following behaviour; the details and counts follow.
+
+| Path | Behaviour (device) |
+|---|---|
+| Host to core RAM: host writes `00c` (words), `014` (SDRAM), `020` (local), `000=1` inside `110=1 .. 110=0` | lands only while the core is stopped (stop answered); no DMA event; 8 KiB in 250..500 µs; up to 2,048 words per transfer proven, a single 9,312-byte transfer did not deliver its tail |
+| Same, source address | bits 2:0 of `014` are ignored: a source 4 bytes past an 8-byte boundary delivers the words from 4 bytes below |
+| Same, destination end | writing continues to the next 32-byte boundary of the local destination (an odd-ended transfer changes the words after it) |
+| Same, into a halted but still enabled core | a transfer starting at local `0x5000` landed one word late in 78 of about 125 tries, and 4 of 1,000 restarts lost the core; with the core disabled first (`134` cleared, `130` pulsed, `108` cleared) 0 of 1,000 and 0 of 125 at `0x5000` landed wrong and 0 of 1,552 restarts lost the core |
+| Core to SDRAM: mode 5 from table RAM `0x600000` (`020`, `014`, `00c`, `008=5`, `000=1`, poll `030 == 1`) | 32-word chunks run at 17..19 MB/s, at most 4 polls of `030` each; words keep their value |
+| Same, destination address | bits 2:0 of `014` are ignored: `+4` lands at `+0`, `+8` and `+16` land in place |
+| Same, length | an odd word count writes one word more; multiples of 2 words write exactly |
+| Host to core registers | `c0c`: all 32 bits; matrix words `34c..3c8`: low 12 bits (word 4, `35c`, kept 8 bits in the first test) |
+| Core to host registers | `a00..a10`: 32 bits; a host write to `a00` does not change what the host reads back |
+| Restart (`134` cleared, `130` pulsed, `108` cleared, then `108=1`, `134=1`) | the core runs from its reset vector with RAM kept; first register write after 1..2 µs for a resident program, 45..175 µs for the first start after an upload |
+| Stop request (`10c`) | the idle event (`514` bit 5) follows only before the first restart |
+| Local RAM | stores hold up to `0x5ffc`; `0x6000..0x7fff` does not hold stores; `0x8000` aliases `0` |
+
+### Core address map, local RAM and DMA registers
 
 **Core address map** (device test: a program in the core read four words at every 16 KiB of its 24-bit address
 space while the host filled `0x22030000..0x2206ffff` with words naming their own SRAM offset):
@@ -672,11 +728,9 @@ follows it. The test program in the core started no such transfer in the device 
 
 A test program in the core that starts the writer stream the same way (`008=3`, `000=1`), sets the writer
 up as `0xbec` does and writes 97 bits gets them, padded to 32 bytes, into the host's ring: the ring holds
-the written bytes and the cursor `034` advanced by `0x20` (device). Mode-5 copies land in SDRAM with each
-32-bit word byte-swapped (the engine stores words big-endian): a two-word copy issued at nine points of a
-reimplementation of the program, from `main` right after the stream start to the end of the frame, lands
-at every point in that order (device); copies that looked undelivered when read in the host's byte order
-were all present. After a mode-5 copy the host reads back its own values in `00c/014/020/008`, while the
+the written bytes and the cursor `034` advanced by `0x20` (device). Mode-5 copies keep each word's value
+(byte order above): a two-word copy issued by a test program at the nine points where the original program could copy, from `main`
+right after the stream start to the end of the frame, lands at every point (device). After a mode-5 copy the host reads back its own values in `00c/014/020/008`, while the
 core reads back the ones it programmed: host and core keep separate copies of these registers (device).
 The original program's slice-statistics copy arrives (130 of 136 poisoned words at host `348[30:0]` change
 after one frame) (device).
@@ -1030,7 +1084,7 @@ All other host registers the two programs use are the same.
 | 1.0.1 encoder program differs (`0x4624` bytes; stream indices 0..4; reads `c00/c04`; reports in `a04`) | 1.0.1 iPod OS image, program at body offset `0x6eac9c`, length word before it | observed |
 | With a test program in the core no DMA form moves data between SDRAM and the core; closing the engine after timed-out inbound transfers can stop the whole device | device tests with a test program in the core | device |
 | Bits a test program writes after the stream start (`008=3`, `000=1`) reach the host's ring | device test; `firmware 0x2018`, `0x25c` | device |
-| Mode-5 copies land with each 32-bit word byte-swapped (big-endian), from boot on; host and core keep separate DMA register copies | device tests (reimplementation of the program with marker copies; core and host read-back) | device |
+| Mode-5 copies work from boot on, at every point the original program could issue one; host and core keep separate DMA register copies | device tests (test program with marker copies; core and host read-back) | device |
 | Host DMA into the core's RAM lands while the core is stopped and inside the `110` bracket, without a DMA event; 8 KiB in 250..500 µs; restart keeps RAM | device tests | device |
 | A host DMA started after the disable lost the core only for programs whose stack lay above `0x6000`; with the program below `0x6000` the transfer lands (128/128 words) and the core answers; stop, DMA, disable, restart keeps it | device tests (held-core input; pipeline program in two layouts) | device |
 | A restart while a host transfer is still arriving keeps a program that lies below `0x6000`; the words that arrived by then are in place (256 B whole at 100 µs; 2,048 B whole in 10 of 12 at 100 µs, all from 150 µs) | device test (restarts 100..2,000 µs after the start, 12 each) | device |
@@ -1039,7 +1093,7 @@ All other host registers the two programs use are the same.
 | After a restart (`134` cleared, `130` pulse, `108` cleared, `108=1`, `134=1`) a stop request answered with `510=1` raises no idle event | device test (8 stop/restart cycles: 16 µs once, then none) | device |
 | All 32 `c0c` bits written by the host reach the core | device test (every bit 8..31 alone, three mixed words) | device |
 | A host write to `a00` leaves its value | device test (write of 0, read back at once) | device |
-| Mode-5 copies byte-swapped by the core before the copy arrive in the host's order, in every size up to 1024 words | device test | device |
+| Every host-core path (host DMA in, mode-5 copy out, `c0c`, matrix words, `a00..a10`) keeps 32-bit word values; a byte stream the core builds with stores at `a ^ 3` reaches the host in byte order only when the core byte-swaps each word before the copy | device tests (word patterns each way; record bytes from byte stores, 32..1,600 bytes, with and without the swap) | device |
 | Mode-5 copies of words the core stored into the table-RAM window (`0x600000`) arrive in the host's order without a byte swap (1, 6 and 256 KiB to 32-aligned SDRAM addresses); with the core's byte swap every word arrives swapped | device test (pattern through the window, 32-word transfers, 17 MB/s) | device |
 | A mode-5 copy to an SDRAM address 4 bytes off an 8-byte boundary does not land in order | device test (1 KiB at +4, with and without the swap) | device |
 | A host transfer into the core reads its source from the address with bits 2:0 cleared (sources at +4, +12, +20, +28 delivered the words from +0, +8, +16, +24) and writes one word more than asked, at the local address asked for | device test (5 transfers, 1..1016 words) | device |
