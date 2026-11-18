@@ -70,6 +70,7 @@ connections. Where a path stores intermediate buffers in RAM the pages say so.
 
 | Hardware / reference | Address or interface | Recovered scope |
 |---|---|---|
+| [Address map and buses](address-map.md) | 38000000..3fffffff | Every block by base, bus region, IRQ, gate and DMA endpoint; HCLK/PCLK evidence |
 | [CPU, caches, MMU and memory](cpu-memory.md) | ROM 20000000; SRAM 22000000; SDRAM 08000000 | ARM/Thumb, CP15 operations, mappings, aliases, handoff |
 | [SDRAM controller](sdram.md) |3d700000; pad controls 3cf00380/384| Cold/warm commands, DLL poll, timing words; field units partly unknown |
 | [Clock/reset controller](clocks-reset.md) |3c500000| PLL and gate operations, all 74 disk gate-table rows |

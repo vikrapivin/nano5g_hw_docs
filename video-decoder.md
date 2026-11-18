@@ -235,8 +235,19 @@ Completion status `1074` as the iPod OS driver reads it (`osos mem:0x082f812c`; 
 | bit 7 | time-out | core reset, the stream stops |
 
 If the `3e0` reset does not read back 0 within the poll limit, the driver ends the picture and skips to
-the next IDR. On the device a four-slice picture now and then ends with one of bits 1..6 set; that the `3e0`
-reset followed by the next slice recovers the picture is not yet device-tested.
+the next IDR.
+
+On the device, slices of multi-slice pictures now and then end with status `0x20` ("idf") or `0x08`:
+1 to 3 of 720 slices per run of a four-slice 640x480 clip, at random places (first macroblock 0, 320,
+600 or 920), and 1 of 768 later slices in a 720x480 clip whose encoder capped the slice size.
+Single-slice pictures never showed the status. The rate does not depend on the time between one slice's
+completion and the next slice's start: runs that waited 0, 20, 100, 500 and 2000 us (the shortest natural
+gap is about 183 us) all had errors, and runs of the same clip with the same wait differ. After a `3e0`
+reset, a picture's first slice started again completes and the picture matches the reference decode.
+A later slice started again also completes with status 1, but the picture differs from the reference and
+the difference carries into the pictures predicted from it (2 to 49 of 180 pictures per clip): the reset
+loses state the earlier slices of the picture left in the engine. The iPod OS reaction (reset, next slice,
+no repeat) leaves the picture wrong as well.
 
 Not known: the sub-blocks the reset bits 9:5 select, motion-plane semantics, whether the
 interlace (field and MBAFF) modes the register layer programs work on this
@@ -260,7 +271,17 @@ Both clients enable clock ID `0x40` and clear bit 0 of `0x3e000004` before use
 start" above), so bit 0 selects between the two engines (inferred from the
 opposite use). Both register IRQ object `0x2d`; the video client's handler is
 `mem:0x082df430`, the JPEG client's `mem:0x080f585c`. The video handler
-acknowledges VIC1 with `0x38e0200c = 0x2000` (bit 13 = source 45).
+acknowledges VIC1 with `0x38e0200c = 0x2000` (bit 13 = source 45) as its first
+store, before it reads the engine (`mem:0x082df43a`). It then reads top status
+`00000` once; bit 8 clears VLD status `10000` and bit 1 clears block status
+`30100`, both without reading them; bit 6 reads DMA status `60000`. DMA status
+is cleared in any case, the completion semaphore is released only when DMA
+status bit 1 was set, and top status is cleared last. There is no refill,
+retry or error path in the handler (`mem:0x082df430`..`0x082df46a`). On its
+first open the video client also sets bit 13 of `0x38e02004`
+(`mem:0x082df41c`, called from `mem:0x082d95a2`; base literal `0x38e02000` read
+from the image), the VIC1 per-source edge-latch word whose acknowledge word is
+`0x38e0200c`; it is never cleared. The AVC engine's IRQ35 gets no such write.
 
 The register file has six windows. Offsets are relative to `0x39600000`; every
 entry is a 32-bit access seen in the iPod OS code named in the last column.
@@ -329,7 +350,10 @@ header (H.263). Width and height are rounded up to macroblocks.
    (`mem:0x082df7c6`), DMA start, then the byte- and bit-skip reads that align
    the engine to the first macroblock bit, then VLD start `c`.
 4. Wait for the DMA-done event with a timeout of `0x42` ticks; on timeout the
-   engine is reset.
+   engine is reset and the picture is treated as decoded
+   (`mem:0x082d98e4`..`0x082d990c`). The bitstream of a picture goes to the
+   engine in one DMA (start at the first macroblock byte, end `len + 0x103`
+   past the data, at most `0x40000` bytes); there is no ring buffer or refill.
 
 The chroma plane of a frame store is one plane of `w*h/2` bytes (inferred:
 interleaved Cb/Cr). Only I and P pictures fit two frame stores; B-VOP handling
@@ -362,6 +386,7 @@ transform and output are done by the engine (inferred).
 | Physical format limits on silicon | not established | not tested |
 | Explicit P with a +128 weight (default at denominator 7) decodes exactly only with the `3400`/`3480` flag words set; without them every such picture and those predicted from it differ | device: four weighted clips, every picture compared, 0 mismatches with the flags, 47..78 without | device |
 | Engine at `0x39600000`, IRQ45, clock ID `0x40` = `0x3c500068` bit 3 | `mem:0x082d954c`, `0x080e44b0`; clock table `mem:0x08551d80`; ISR `0x082df430` VIC1 bit 13 | observed |
+| IRQ45 set to edge-latched (`0x38e02004` bit 13) on the first open, acknowledged through `0x38e0200c` as the handler's first store | `mem:0x082df41c` from `mem:0x082d95a2`; literal pools `mem:0x082df42c`, `0x082df46c`; handler `mem:0x082df43a` | observed; with the edge latch set, pictures complete on the device (next rows) |
 | `0x3e000004` bit 0 cleared for this engine, set for AVC | `mem:0x082d954c`, `0x080cb838` | observed; selector meaning inferred |
 | MPEG-4 Part 2 and H.263 (short header) decode path | `mem:0x082d954c`, `0x082d96c8`; start codes `1b0`, `120..12f`, `1b6` as call arguments | observed (code not defined as functions in the analysed image; read with a read-only disassembly) |
 | Register windows `00000`/`10000`/`30000`/`41200`/`50000`/`60000` and their writes | literal pools `mem:0x080e48d8..0x080e4908`, `0x082df46c..0x082df484`, `0x082df904..0x082df91c`, `0x082dfcb4..0x082dfcd0`, `0x082e0920`, `0x082ea73c..0x082ea748` | observed |
@@ -370,7 +395,11 @@ transform and output are done by the engine (inferred).
 | JPEG still decoding uses the same engine | `mem:0x080e44b0`, `0x080f5114`, ISR `0x08106794`; JPEG tables `mem:0x08466c18` | observed; split of work inferred |
 | Frame-store addresses written as the bus address with bit 31 cleared | `mem:0x082dfcda` (`lsls #1; lsrs #1`) | observed |
 | No B-VOP path | bounded: the two-store sequence in `mem:0x082d96c8` | inferred |
-| Engine responds on silicon | not established | not tested |
+| Engine responds on silicon: with clock ID `0x40` enabled, `0002c` reads 3, `41808` reads 1, `60000` reads `40`, the other 43 listed registers read 0, IRQ45 stays low; all 128 matrix words read non-zero before any write and three matrix writes read back with neighbours unchanged | device identification probe (reads, three write/restore pairs, nothing decoded) | device |
+| Without the IRQ45 edge latch, pictures mostly end without IRQ45 (time-out with top status `100`, VLD status 4, DMA status 0) | device: clips 22..31 (MPEG-4 SP/ASP, H.263), every hardware pass | device |
+| With the edge latch, I and P pictures complete and differ from a software decode (FFmpeg) by at most 2 per sample; the QCIF H.263 clip differs by up to 255 from macroblock 4 of row 0 | device: clips 22..31, every hardware picture compared | device; QCIF cause not established |
+| With the edge latch, each clip still times out after a clip-dependent number of pictures (6 to 62) with top status `100`, VLD status 4, DMA status 0, and several runs count more interrupts than pictures; completed pictures show top `140` | device: clips 22..31 | device; a lost completion edge is the leading explanation (not tested) |
 | No reference to `0x396xxxxx` in the restore OS, bootloader or diagnostics images | bounded: aligned 32-bit literal scan of the disk, bootloader and diag images (the diag modules inside their firmware volume were searched only where they are stored uncompressed) | observed negative, bounded |
 | Completion status `1074`: bits 1..6 are slice-syntax errors (VLC, macroblock type, sub-macroblock type, pattern, "idf", delta QP) after which the driver resets the core with `1004 = 0x3e0` and continues with the next slice; bit 7 is a time-out | `osos mem:0x082e24a4..0x082e24f2` (one bit test per message), `mem:0x082ee0f8` | observed |
 | CABAC, B slices (spatial and temporal direct, pyramid), explicit/implicit weights, 8x8 transform, custom scaling lists, up to four slices per picture and pictures up to 1280x720 decode exactly with the programming above | device: 21 clips, every picture compared with a software decoder, 0 mismatches; four-slice pictures intermittently end with an error status | device |
+| Slices of multi-slice pictures now and then end with status `0x20` or `0x08`, at random, whatever the time between slices (0 to 2000 us); after a `3e0` reset a repeated first slice gives the right picture, a repeated later slice does not | device: four-slice clips 03/04, six runs each at different waits, failing slice's first macroblock recorded; a slice-size-capped 720x480 clip | device; the cause is not established |

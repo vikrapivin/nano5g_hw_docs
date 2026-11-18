@@ -6,7 +6,7 @@ DMA and interrupts, initialization and shutdown sequences, with the firmware
 address each fact comes from. Values whose meaning is unknown are listed as
 such.
 
-- **System:** [CPU/memory](cpu-memory.md), [SDRAM](sdram.md),
+- **System:** [address map and buses](address-map.md), [CPU/memory](cpu-memory.md), [SDRAM](sdram.md),
   [clocks/reset](clocks-reset.md), [bus fabric](bus-fabric.md),
   [interrupts](interrupts.md), [byte order](byte-order.md), [timers/watchdog](timers-watchdog.md),
   [GPIO](gpio-pinmux.md), [I2C](i2c.md), [PL080 DMA](dma.md), [DMAC2](dma2.md).

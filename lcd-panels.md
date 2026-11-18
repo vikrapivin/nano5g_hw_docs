@@ -103,6 +103,15 @@ plus `ffffff`, `00ffff`, `ff00ff` and the primaries; patterns are BMPs from the 
 drawn through GOP Blt; options `--iqc`, `--fatp`, `--dqe` (`+0x1266..0x1436`).
 `DisplayPlatform` method 0 with argument 1 is used only by `lcd off`; its sleep-script role is inferred.
 
+## Panel memory read
+
+After a column and row window (`2a`, `2b`) in command mode, command `2e` (memory read) sent in the
+interface's 8-bit serial mode returns data: a first byte, then the window's pixels, and a framebuffer
+picture of eight colour bars reads back with a two-byte period per pixel (pure red reads `fc 00`).
+The byte layout of a pixel is not yet decoded. In two runs, reads taken after a direct RGB565 DMA
+transfer and after a compositor picture with a 512-byte line pitch returned only zero bytes, while reads
+after the framebuffer and after a packed compositor picture returned data (device).
+
 ## Finding ledger
 
 | Finding | Evidence | Type |
@@ -112,3 +121,4 @@ drawn through GOP Blt; options `--iqc`, `--fatp`, `--dqe` (`+0x1266..0x1436`).
 | Panel pinout, ratings, vendor fields | not in recovered scripts | meaning unknown |
 | Panel reset GPIO port 9 bit 7, 120 ms waits | `diag TestLCDDisplay.pe+0x1d2c..0x1d6c` | observed |
 | LCD protocol methods and write-script grammar, ID register `04` byte names | `diag TestLCDDisplay.pe+0x1e20..0x1f28`, `+0x1da0..0x1dd2` | observed |
+| Memory read `2e` in 8-bit serial mode returns pixel data, two bytes per pixel (red `fc 00`); layout not decoded | device: framebuffer colour bars read back, rows 100..103 | device |
